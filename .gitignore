@@ -1,0 +1,8 @@
+*_scene/
+skill_test*/
+downloaded_imagery/
+acceptance/
+__pycache__/
+.DS_Store
+*.tif
+*.geojson
