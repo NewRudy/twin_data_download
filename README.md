@@ -8,8 +8,8 @@
 | 高程 DEM | Copernicus GLO-30 | GeoTIFF (EPSG:4326)，标称 30m |
 | 建筑物 | OpenStreetMap（Overpass API） | GeoJSON（含高度估算） |
 | 道路/铁路/水系/绿地 | OpenStreetMap（同一次 Overpass 查询） | 各自独立 GeoJSON，"OSM 提供啥就提取啥" |
-| 3D 白模 | 由建筑轮廓挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗/按建筑类型调色） | 3D Tiles 1.0（b3dm + tileset.json） |
-| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh；纹理模式/高度分析预设、图层开关、42° 斜视角 |
+| 3D 白模 | 由建筑轮廓挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗/按建筑类型调色；逐栋 batchId） | 3D Tiles 1.0（b3dm + tileset.json + batch table） |
+| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh；悬停/单击高亮拾取+信息卡、纹理/高度预设、图层开关、42° 斜视角 |
 | 下载报告 | — | download_report.json（数据源/瓦片数/失败数/各图层要素数） |
 
 建筑数据**有就生成、没有就跳过**：OSM 覆盖不到的位置自动跳过建筑与 3D Tiles，
@@ -71,6 +71,8 @@ GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数）
 ```
 
 接入 Cesium 平台：向场景注册 `buildings_3dtiles/tileset.json` 的完整 URL；
+b3dm 内含逐栋 batch table（名称/类型/高度/层数/地址/占地/OSM ID），
+平台侧可用 `Cesium3DTileFeature.getProperty()` 直接读栋级属性、`feature.color` 做高亮；
 GeoJSON 白模可用 `extrudedHeight=top_m / height=base_m` 客户端挤出，样式可调。
 
 ## 证据边界（重要）

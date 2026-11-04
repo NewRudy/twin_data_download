@@ -14,7 +14,20 @@ def dissect(path):
     data = open(path, "rb").read()
     magic, ver, total, ftj, ftb, btj, btb = struct.unpack("<4sIIIIII", data[:28])
     assert magic == b"b3dm", magic
-    glb = data[28 + ftj + ftb + btj + btb:]
+    # feature table JSON + batch table JSON (紧随 28 字节头)
+    ft = json.loads(data[28:28 + ftj])
+    print(f"feature table: {ft}")
+    pos = 28 + ftj + ftb
+    if btj:
+        bt = json.loads(data[pos:pos + btj])
+        lens = {k: (len(v) if isinstance(v, list) else "-") for k, v in bt.items()}
+        print(f"batch table: {len(bt)} 属性, 长度 {lens}")
+        named = [i for i, v in enumerate(bt.get("name", [])) if v]
+        print(f"  有名字的建筑: {len(named)}  示例: "
+              + str([(i, bt['name'][i], bt['height_m'][i]) for i in named[:3]]))
+    else:
+        print("batch table: 无")
+    glb = data[pos + btj + btb:]
     assert glb[:4] == b"glTF", glb[:4]
     jlen, jtype = struct.unpack("<II", glb[12:20])
     assert jtype == 0x4E4F534A, hex(jtype)  # 'JSON'
@@ -23,6 +36,10 @@ def dissect(path):
     blen, btype = struct.unpack("<II", glb[off:off + 8])
     assert btype == 0x004E4942, hex(btype)  # 'BIN\0'
     binc = glb[off + 8: off + 8 + blen]
+    # buffers.byteLength 必须与 BIN chunk 一致 (允许 ≤3 字节对齐填充差)
+    declared = gj["buffers"][0]["byteLength"]
+    if not (blen - 3 <= declared <= blen):
+        print(f"!! buffer 长度不一致: 声明 {declared} vs BIN {blen} — 模型可能渲染异常")
 
     prims = gj["meshes"][0]["primitives"]
     print(f"primitives: {len(prims)}")

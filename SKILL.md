@@ -13,8 +13,8 @@ description: 按坐标点一键下载数字孪生场景基础数据——高清�
 | 高程 DEM | Copernicus GLO-30 | 30m（标称） | GeoTIFF (EPSG:4326) |
 | 建筑物 | OpenStreetMap (Overpass) | 覆盖度不一（中国县城可能稀疏） | GeoJSON (EPSG:4326) + 属性高度 |
 | 道路/铁路/水系/绿地 | OpenStreetMap (Overpass, 同一次查询) | 覆盖随 OSM | 各自独立 GeoJSON |
-| 3D 白模 | 上述建筑挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗，按建筑类型调色） | 高度 POLICY 估算 | 3D Tiles 1.0 (b3dm + tileset.json) |
-| 预览页 | CesiumJS | 验收用 | cesium_preview.html + serve.sh，图层开关/纹理-高度预设/42° 斜视角 |
+| 3D 白模 | 上述建筑挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗，按建筑类型调色；逐栋 batchId 可拾取高亮） | 高度 POLICY 估算 | 3D Tiles 1.0 (b3dm + tileset.json + batch table) |
+| 预览页 | CesiumJS | 验收用 | cesium_preview.html + serve.sh，悬停/单击高亮拾取+信息卡、图层开关/预设/42° 斜视角 |
 
 另产出 `download_report.json`：记录数据源、瓦片数、失败数、高度估算占比等证据。
 
@@ -151,8 +151,12 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
   预设模式切换✓、零 JS 错误✓。**屋顶 bug 修复**：此前屋顶画在楼底(楼顶敞口, doubleSided
   材质下呈"凹进去的空盒")，修复后解剖确认屋顶 12192 顶点全部位于 3~53m 楼顶高度、
   贴地异常 0；陡视角截图封闭平顶✓。**材质升级**：程序化立面纹理(窗格/亮灯窗/COLOR_0
-  类型调色)嵌入 b3dm(2.0MB)，近景窗格可见✓。教训：自写 GLB 解剖脚本曾漏跳 BIN chunk
-  8 字节头导致"验证通过"的假证据，现已固化为 scripts/dissect_b3dm.py（带 chunk 类型断言）。
+  类型调色)嵌入 b3dm(2.0MB)，近景窗格可见✓。**高亮拾取**：b3dm 带 _BATCHID+batch table
+  (10 属性×1014 栋)，悬停浅蓝/单击深蓝高亮+信息卡(名称/类型/高度(标注估算)/层数/地址/
+  占地/OSM ID)✓。教训×2：自写 GLB 解剖脚本曾漏跳 BIN chunk 8 字节头导致"验证通过"的
+  假证据；build_glb 曾把 buffers.byteLength 在图片 view 追加前写死导致模型渲染异常
+  （dissect_b3dm.py 已加 buffer 长度断言防复发）。另: 巨大灰板有时不是 bug——
+  虹桥站在 OSM 里就是几百米宽、6m 高的建筑足迹。
   截图于 小涞港示范区_scene/acceptance/2026-11-04-*.png。
 - **2026-11-03 Rudy Mac**（macOS, `~/.venv_imagery`, Cesium 1.142）：
   永新山区点（0 建筑→软跳过✓）+ 永新县城点全链路通过——影像 GeoTIFF✓、

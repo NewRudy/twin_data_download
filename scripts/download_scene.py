@@ -574,18 +574,24 @@ def osm_to_features(elements, dem_sample):
         cen = poly.centroid
         base = dem_sample(cen.x, cen.y) + mh
         coords = [[list(p) for p in ring] for ring in rings_lonlat]
+        t = tags or {}
+        addr = ", ".join(x for x in (t.get("addr:street"), t.get("addr:housenumber"),
+                                     t.get("addr:city")) if x)
         feats.append({
             "type": "Feature",
             "geometry": {"type": "Polygon", "coordinates": coords},
             "properties": {
                 "osm_id": osm_id,
-                "name": tags.get("name", "") if tags else "",
-                "building": tags.get("building", "yes") if tags else "yes",
+                "name": t.get("name", ""),
+                "building": t.get("building", "yes"),
                 "height_m": round(h, 2),
                 "base_m": round(base, 2),
                 "top_m": round(base + h, 2),
                 "height_source": hsrc,
                 "area_m2_est": round(area_m2, 1),
+                "levels": t.get("building:levels", ""),
+                "amenity": t.get("amenity", ""),
+                "addr": addr,
             },
         })
 
@@ -739,6 +745,10 @@ def build_glb(prims, materials, texture_png=None):
             col = np.asarray(pr["colors"], dtype=np.uint8).reshape(-1, 4)
             attrs["COLOR_0"] = add_acc(add_view(col.tobytes()), 5121,
                                        len(col), "VEC4", normalized=True)
+        if pr.get("batchids") is not None:
+            bid = np.asarray(pr["batchids"], dtype="<f4")
+            attrs["_BATCHID"] = add_acc(add_view(bid.tobytes()), 5126,
+                                        len(bid), "SCALAR")
         prims_json.append({"attributes": attrs, "material": pr["material"]})
 
     json_data = {
@@ -758,6 +768,8 @@ def build_glb(prims, materials, texture_png=None):
         json_data["samplers"] = [{"wrapS": 10497, "wrapT": 10497,
                                   "magFilter": 9729, "minFilter": 9729}]
         json_data["textures"] = [{"sampler": 0, "source": 0}]
+    # 图片 view 在上面才追加, buffer 总长必须最后再写
+    json_data["buffers"][0]["byteLength"] = offset
 
     js = json.dumps(json_data, separators=(",", ":")).encode()
     js_padded = js + b" " * ((4 - len(js) % 4) % 4)
@@ -771,11 +783,18 @@ def build_glb(prims, materials, texture_png=None):
     return glb
 
 
-def wrap_b3dm(glb):
-    ft_json = json.dumps({"BATCH_LENGTH": 0}).encode()
+def wrap_b3dm(glb, batch_table=None, batch_length=0):
+    ft_json = json.dumps({"BATCH_LENGTH": batch_length}, separators=(",", ":")).encode()
     ft_json += b" " * ((8 - len(ft_json) % 8) % 8)
-    total = 28 + len(ft_json) + len(glb)
-    return b"b3dm" + struct.pack("<IIIII", 1, total, len(ft_json), 0, 0) + b"\0\0\0\0" + ft_json + glb
+    bt_json = b""
+    if batch_table:
+        bt_json = json.dumps(batch_table, ensure_ascii=False,
+                             separators=(",", ":")).encode()
+        bt_json += b" " * ((8 - len(bt_json) % 8) % 8)
+    total = 28 + len(ft_json) + len(bt_json) + len(glb)
+    # 28 字节头: magic + version + byteLength + ftJSONlen + ftBINlen + btJSONlen + btBINlen
+    return (b"b3dm" + struct.pack("<IIIIII", 1, total, len(ft_json), 0, len(bt_json), 0)
+            + ft_json + bt_json + glb)
 
 
 MODULE_M = 3.0  # 纹理模块对应实地 3m (窗宽/层高)
@@ -790,11 +809,13 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
     import random as _random
     os.makedirs(out_dir, exist_ok=True)
     rnd = _random.Random(20261104)
-    wall_pos, wall_nor, wall_uv, wall_col = [], [], [], []
-    roof_pos, roof_nor, roof_col = [], [], []
+    wall_pos, wall_nor, wall_uv, wall_col, wall_bids = [], [], [], [], []
+    roof_pos, roof_nor, roof_col, roof_bids = [], [], [], []
     max_e = max_n = max_u = -1e18
     min_e = min_n = min_u = 1e18
     skipped = 0
+    next_bid = 0
+    picked_props = []
 
     def push(target_pos, target_nor, v1, v2, v3):
         target_pos.extend([v1, v2, v3])
@@ -826,6 +847,9 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
         tint = _bldg_tint((p.get("building") or "yes").lower(), rnd)
         h_m = top - base
         phase = rnd.choice((0.0, 0.25, 0.5, 0.75))
+        bid = next_bid
+        next_bid += 1
+        picked_props.append(p)
 
         # 墙面 (带 UV + COLOR_0; 环逆时针, 边朝外法线, gl 映射后朝外)
         cum = 0.0
@@ -843,11 +867,13 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
             push(wall_pos, wall_nor, gl(v2), gl(v2t), gl(v1t))
             wall_uv.extend([uv_b, uv_d, uv_c])
             wall_col.extend([tint] * 6)
+            wall_bids.extend([bid] * 6)
 
         # 屋顶 (环已在 2D 归一化为逆时针; gl 映射 z=-n 后 (a,b,c) 顺序法线朝 +Y)
         for a, b, c in tris:
             push(roof_pos, roof_nor, gl(ring_top[a]), gl(ring_top[b]), gl(ring_top[c]))
             roof_col.extend([tint] * 3)
+            roof_bids.extend([bid] * 3)
 
         for v in ring3d:
             max_e, max_n = max(max_e, v[0]), max(max_n, v[1])
@@ -871,13 +897,20 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
     ]
     prims = [
         {"positions": wall_pos, "normals": wall_nor, "uvs": wall_uv,
-         "colors": wall_col, "material": 0},
-        {"positions": roof_pos, "normals": roof_nor, "colors": roof_col, "material": 1},
+         "colors": wall_col, "batchids": wall_bids, "material": 0},
+        {"positions": roof_pos, "normals": roof_nor, "colors": roof_col,
+         "batchids": roof_bids, "material": 1},
     ]
     glb = build_glb(prims, materials, texture_png=make_facade_png())
+    # batch table: 逐栋属性, 供 Cesium 拾取显示 (对标 map3d 信息卡)
+    batch_table = {
+        k: [pp.get(k, "") for pp in picked_props]
+        for k in ("osm_id", "name", "building", "height_m", "top_m",
+                  "levels", "amenity", "addr", "area_m2_est", "height_source")
+    }
     b3dm_path = os.path.join(out_dir, "scene.b3dm")
     with open(b3dm_path, "wb") as fh:
-        fh.write(wrap_b3dm(glb))
+        fh.write(wrap_b3dm(glb, batch_table=batch_table, batch_length=len(picked_props)))
 
     pad = 20.0
     umid = (min_u + max_u) / 2
@@ -931,10 +964,23 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   #panel #layers label{margin-top:2px;}
   #panel .meta{color:#9ab;font-size:12px;margin-top:8px;border-top:1px solid #345;padding-top:8px;}
   #status{color:#fa0;}
+  #pick{position:absolute;left:12px;bottom:12px;z-index:9;background:rgba(255,255,255,.94);
+        color:#1b2733;padding:12px 14px;border-radius:10px;font:13px/1.6 system-ui,sans-serif;
+        width:212px;box-shadow:0 2px 14px rgba(0,0,0,.35);}
+  #pick h4{margin:0 0 6px;font-size:15px;border-bottom:1px solid rgba(0,0,0,.08);padding-bottom:5px;}
+  #pick .row{display:flex;justify-content:space-between;gap:8px;}
+  #pick .row span{color:#5a6a78;white-space:nowrap;}
+  #pick .row b{font-weight:600;text-align:right;word-break:break-all;}
+  #pick .tip{color:#8a97a3;font-size:11px;margin-top:6px;}
 </style>
 </head>
 <body>
 <div id="cesium"></div>
+<div id="pick" hidden>
+  <h4 id="pkName"></h4>
+  <div id="pkRows"></div>
+  <div class="tip">单击选择 / 空白处取消 / Esc 取消</div>
+</div>
 <div id="panel">
   <h3>__NAME__</h3>
   <label><input type="checkbox" id="ckTiles" checked> 建筑·纹理白模（3D Tiles 离线包）</label>
@@ -1093,6 +1139,61 @@ function styleGreen(ent){
         if (tiles) tiles.show = (p !== "heat");
         if (geoSrc) geoSrc.show = (p !== "tex");
       };
+    });
+
+    // —— 高亮拾取 (对标 map3d: 悬停浅高亮 + 单击选中 + 信息卡) ——
+    const pickEl = document.getElementById("pick");
+    const HOVER_C = Cesium.Color.fromCssColorString("#a9ccff");
+    const SELECT_C = Cesium.Color.fromCssColorString("#5c96ff");
+    let hoveredF = null, selectedF = null;
+    const setClr = (f, c) => { if (f && f.color) f.color = c; };
+    function showInfo(f) {
+      const g = k => {
+        const v = f.getProperty(k);
+        return (v === undefined || v === null) ? "" : String(v);
+      };
+      document.getElementById("pkName").textContent = g("name") || "建筑信息";
+      const rows = [];
+      const add = (label, val) => {
+        if (val) rows.push(`<div class="row"><span>${label}</span><b>${val}</b></div>`);
+      };
+      const b = g("building");
+      if (b && b !== "yes") add("类型", b);
+      const h = g("height_m");
+      if (h) add("高度", `${h} m${g("height_source") && g("height_source").indexOf("osm") < 0 ? " (估算)" : ""}`);
+      if (g("levels")) add("层数", g("levels"));
+      if (g("amenity")) add("设施", g("amenity"));
+      if (g("addr")) add("地址", g("addr"));
+      if (g("area_m2_est")) add("占地", `${g("area_m2_est")} m²`);
+      add("OSM ID", g("osm_id"));
+      document.getElementById("pkRows").innerHTML = rows.join("");
+      pickEl.hidden = false;
+    }
+    const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
+    handler.setInputAction(m => {
+      const pk = viewer.scene.pick(m.position);
+      if (selectedF) setClr(selectedF, Cesium.Color.WHITE);
+      if (pk instanceof Cesium.Cesium3DTileFeature) {
+        selectedF = pk;
+        setClr(selectedF, SELECT_C);
+        showInfo(pk);
+      } else {
+        selectedF = null;
+        pickEl.hidden = true;
+      }
+    }, Cesium.ScreenSpaceEventType.LEFT_CLICK);
+    handler.setInputAction(m => {
+      if (hoveredF && hoveredF !== selectedF) setClr(hoveredF, Cesium.Color.WHITE);
+      const pk = viewer.scene.pick(m.endPosition);
+      hoveredF = (pk instanceof Cesium.Cesium3DTileFeature) ? pk : null;
+      if (hoveredF && hoveredF !== selectedF) setClr(hoveredF, HOVER_C);
+    }, Cesium.ScreenSpaceEventType.MOUSE_MOVE);
+    window.addEventListener("keydown", e => {
+      if (e.key === "Escape" && selectedF) {
+        setClr(selectedF, Cesium.Color.WHITE);
+        selectedF = null;
+        pickEl.hidden = true;
+      }
     });
 
     document.getElementById("ckGeo").onchange = e => { if(geoSrc) geoSrc.show = e.target.checked; };
