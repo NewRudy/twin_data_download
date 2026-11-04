@@ -628,36 +628,141 @@ def project_enu(lon, lat, lon0, lat0):
     return e, n
 
 
-def build_glb(tri_positions, tri_normals):
-    """非索引化三角形 → glTF 2.0 GLB (二进制)。坐标: X=E, Y=U, Z=-N。"""
-    pos = np.asarray(tri_positions, dtype="<f4").reshape(-1, 3)
-    nor = np.asarray(tri_normals, dtype="<f4").reshape(-1, 3)
-    pos_bytes, nor_bytes = pos.tobytes(), nor.tobytes()
+def make_facade_png():
+    """程序化立面纹理图集 256x1024 (4 个 3m×3m 模块纵向排列, REPEAT 循环)。
+
+    v 方向随楼层循环: 普通窗 / 宽窗 / 亮灯窗 / 条形高窗, 25% 楼层亮灯。
+    """
+    import io
+    from PIL import Image, ImageDraw
+    W, M = 256, 256
+    H = M * 4
+    img = Image.new("RGB", (W, H))
+    dr = ImageDraw.Draw(img)
+    rows = [
+        {"bg": (217, 212, 203), "win": (70, 80, 92),   "frame": (231, 228, 222),
+         "rect": (64, 64, 192, 192), "sill": True},
+        {"bg": (213, 209, 201), "win": (77, 88, 102),  "frame": (229, 225, 219),
+         "rect": (56, 72, 200, 168), "sill": True},
+        {"bg": (215, 212, 205), "win": (227, 199, 143), "frame": (222, 217, 208),
+         "rect": (64, 64, 192, 192), "sill": False},
+        {"bg": (205, 208, 211), "win": (88, 99, 110),  "frame": (224, 222, 218),
+         "rect": (44, 44, 212, 96), "sill": False},
+    ]
+    for i, r in enumerate(rows):
+        y0 = i * M
+        dr.rectangle([0, y0, W - 1, y0 + M - 1], fill=r["bg"])
+        x0, yy0, x1, yy1 = r["rect"]
+        # 窗框 (略外扩)
+        dr.rectangle([x0 - 5, y0 + yy0 - 5, x1 + 5, y0 + yy1 + 5], fill=r["frame"])
+        # 玻璃 (上深下浅模拟反光)
+        gx0, gy0, gx1, gy1 = x0, y0 + yy0, x1, y0 + yy1
+        dr.rectangle([gx0, gy0, gx1, gy1], fill=r["win"])
+        dr.rectangle([gx0, gy0, gx1, gy0 + (gy1 - gy0) // 3], fill=tuple(
+            max(0, c - 12) for c in r["win"]))
+        if r["sill"]:  # 窗台
+            dr.rectangle([x0 - 9, gy1, x1 + 9, gy1 + 8], fill=(178, 172, 163))
+    arr = np.asarray(img).astype("int16")
+    noise = np.random.default_rng(20261104).normal(0, 3.2, arr.shape).astype("int16")
+    arr = np.clip(arr + noise, 0, 255).astype("uint8")
+    buf = io.BytesIO()
+    Image.fromarray(arr).save(buf, "PNG", optimize=True)
+    return buf.getvalue()
+
+
+# 按建筑类型的 COLOR_0 色调 (乘在纹理上)
+_WARM = {"residential", "apartments", "house", "detached", "terrace",
+         "semidetached_house", "bungalow", "yes", "dormitory"}
+_COOL = {"commercial", "retail", "office", "supermarket", "hotel",
+         "government", "civic", "mixed"}
+_GRAY = {"industrial", "warehouse", "garage", "shed", "service", "farm_auxiliary"}
+_CYAN = {"school", "university", "hospital", "public"}
+
+
+def _bldg_tint(btype, rnd):
+    if btype in _COOL:
+        base = (238, 243, 251)
+    elif btype in _GRAY:
+        base = (229, 231, 235)
+    elif btype in _CYAN:
+        base = (249, 248, 254)
+    else:
+        base = (252, 249, 242)
+    j = rnd.randint(-8, 3)
+    return tuple(max(0, min(255, c + j)) for c in base) + (255,)
+
+
+def build_glb(prims, materials, texture_png=None):
+    """多 primitive glTF 2.0 GLB。prims: [{positions,normals,uvs?,colors?,material}]。
+
+    坐标: X=E, Y=U, Z=-N。texture_png 非空时嵌入 image 0 (sampler REPEAT)。
+    """
+    views, accs, bin_parts = [], [], []
+    offset = 0
+
+    def add_view(data, target=34962):
+        nonlocal offset
+        pad = (4 - offset % 4) % 4
+        if pad:
+            bin_parts.append(b"\0" * pad)
+            offset += pad
+        v = {"buffer": 0, "byteOffset": offset, "byteLength": len(data)}
+        if target:
+            v["target"] = target
+        views.append(v)
+        bin_parts.append(data)
+        offset += len(data)
+        return len(views) - 1
+
+    prims_json = []
+
+    def add_acc(view, ctype, count, vtype, mn=None, mx=None, normalized=False):
+        a = {"bufferView": view, "componentType": ctype, "count": count, "type": vtype}
+        if normalized:
+            a["normalized"] = True
+        if mn is not None:
+            a["min"], a["max"] = mn, mx
+        accs.append(a)
+        return len(accs) - 1
+
+    for pr in prims:
+        pos = np.asarray(pr["positions"], dtype="<f4").reshape(-1, 3)
+        nor = np.asarray(pr["normals"], dtype="<f4").reshape(-1, 3)
+        attrs = {}
+        attrs["POSITION"] = add_acc(add_view(pos.tobytes()), 5126, len(pos), "VEC3",
+                                    pos.min(axis=0).tolist(), pos.max(axis=0).tolist())
+        attrs["NORMAL"] = add_acc(add_view(nor.tobytes()), 5126, len(nor), "VEC3")
+        if pr.get("uvs") is not None:
+            uv = np.asarray(pr["uvs"], dtype="<f4").reshape(-1, 2)
+            attrs["TEXCOORD_0"] = add_acc(add_view(uv.tobytes()), 5126, len(uv), "VEC2")
+        if pr.get("colors") is not None:
+            col = np.asarray(pr["colors"], dtype=np.uint8).reshape(-1, 4)
+            attrs["COLOR_0"] = add_acc(add_view(col.tobytes()), 5121,
+                                       len(col), "VEC4", normalized=True)
+        prims_json.append({"attributes": attrs, "material": pr["material"]})
 
     json_data = {
-        "asset": {"version": "2.0", "generator": "gis-data-download/1.0"},
+        "asset": {"version": "2.0", "generator": "gis-data-download/1.1"},
         "scene": 0,
         "scenes": [{"nodes": [0]}],
         "nodes": [{"mesh": 0}],
-        "meshes": [{"primitives": [{"attributes": {"POSITION": 0, "NORMAL": 1}, "material": 0}]}],
-        "materials": [{"pbrMetallicRoughness": {
-            "baseColorFactor": [0.85, 0.87, 0.9, 1.0],
-            "metallicFactor": 0.0, "roughnessFactor": 0.9}, "doubleSided": True}],
-        "buffers": [{"byteLength": len(pos_bytes) + len(nor_bytes)}],
-        "bufferViews": [
-            {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes), "target": 34962},
-            {"buffer": 0, "byteOffset": len(pos_bytes), "byteLength": len(nor_bytes), "target": 34962},
-        ],
-        "accessors": [
-            {"bufferView": 0, "componentType": 5126, "count": len(pos), "type": "VEC3",
-             "min": pos.min(axis=0).tolist(), "max": pos.max(axis=0).tolist()},
-            {"bufferView": 1, "componentType": 5126, "count": len(nor), "type": "VEC3"},
-        ],
+        "meshes": [{"primitives": prims_json}],
+        "materials": materials,
+        "buffers": [{"byteLength": offset}],
+        "bufferViews": views,
+        "accessors": accs,
     }
+    if texture_png is not None:
+        iv = add_view(texture_png, target=None)
+        json_data["images"] = [{"bufferView": iv, "mimeType": "image/png"}]
+        json_data["samplers"] = [{"wrapS": 10497, "wrapT": 10497,
+                                  "magFilter": 9729, "minFilter": 9729}]
+        json_data["textures"] = [{"sampler": 0, "source": 0}]
+
     js = json.dumps(json_data, separators=(",", ":")).encode()
     js_padded = js + b" " * ((4 - len(js) % 4) % 4)
-    bin_padded = pos_bytes + nor_bytes
-    bin_padded += b"\0" * ((4 - len(bin_padded) % 4) % 4)
+    bin_data = b"".join(bin_parts)
+    bin_padded = bin_data + b"\0" * ((4 - len(bin_data) % 4) % 4)
 
     total = 12 + 8 + len(js_padded) + 8 + len(bin_padded)
     glb = b"glTF" + struct.pack("<II", 2, total)
@@ -673,13 +778,34 @@ def wrap_b3dm(glb):
     return b"b3dm" + struct.pack("<IIIII", 1, total, len(ft_json), 0, 0) + b"\0\0\0\0" + ft_json + glb
 
 
+MODULE_M = 3.0  # 纹理模块对应实地 3m (窗宽/层高)
+
+
 def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
-    """建筑挤出为单 tile b3dm + tileset.json。坐标系: tile 局部 ENU(z-up)。"""
+    """建筑挤出为单 tile b3dm + tileset.json。坐标系: tile 局部 ENU(z-up)。
+
+    双材质: 墙面 = 程序化立面纹理(REPEAT, 按层高循环, COLOR_0 按建筑类型调色),
+    屋顶 = 素色深灰。单栋一次生成, 随机 v 相位让亮灯窗错落。
+    """
+    import random as _random
     os.makedirs(out_dir, exist_ok=True)
-    positions, normals = [], []
+    rnd = _random.Random(20261104)
+    wall_pos, wall_nor, wall_uv, wall_col = [], [], [], []
+    roof_pos, roof_nor, roof_col = [], [], []
     max_e = max_n = max_u = -1e18
     min_e = min_n = min_u = 1e18
     skipped = 0
+
+    def push(target_pos, target_nor, v1, v2, v3):
+        target_pos.extend([v1, v2, v3])
+        ax, ay, az = v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]
+        bx, by, bz = v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]
+        nx, ny, nz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+        ln = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
+        target_nor.extend([(nx / ln, ny / ln, nz / ln)] * 3)
+
+    def gl(v):  # ENU(x=e, y=n, z=up) → glTF(x=e, y=up, z=-n)
+        return (v[0], v[2], -v[1])
 
     for f in feats:
         p = f["properties"]
@@ -696,38 +822,59 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
             skipped += 1
             continue
         ring3d = [(e, n, base) for e, n in ring2d]
+        ring_top = [(e, n, top) for e, n in ring2d]
+        tint = _bldg_tint((p.get("building") or "yes").lower(), rnd)
+        h_m = top - base
+        phase = rnd.choice((0.0, 0.25, 0.5, 0.75))
 
-        def push_tri(v1, v2, v3):
-            positions.extend([v1, v2, v3])
-            ax, ay, az = v2[0] - v1[0], v2[1] - v1[1], v2[2] - v1[2]
-            bx, by, bz = v3[0] - v1[0], v3[1] - v1[1], v3[2] - v1[2]
-            nx, ny, nz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
-            ln = math.sqrt(nx * nx + ny * ny + nz * nz) or 1.0
-            normals.extend([(nx / ln, ny / ln, nz / ln)] * 3)
-
-        def gl(v):  # ENU(x=e, y=n, z=up) → glTF(x=e, y=up, z=-n)
-            return (v[0], v[2], -v[1])
-
-        # 屋顶 (环已在 2D 归一化为逆时针; gl 映射 z=-n 后 (a,b,c) 顺序法线朝 +Y)
-        for a, b, c in tris:
-            push_tri(gl(ring3d[a]), gl(ring3d[b]), gl(ring3d[c]))
-        # 墙面
+        # 墙面 (带 UV + COLOR_0; 环逆时针, 边朝外法线, gl 映射后朝外)
+        cum = 0.0
         m = len(ring3d)
         for i in range(m):
             v1, v2 = ring3d[i], ring3d[(i + 1) % m]
-            v1t, v2t = (v1[0], v1[1], top), (v2[0], v2[1], top)
-            push_tri(gl(v1), gl(v2), gl(v1t))
-            push_tri(gl(v2), gl(v2t), gl(v1t))
+            v1t, v2t = ring_top[i], ring_top[(i + 1) % m]
+            edge = math.hypot(v2[0] - v1[0], v2[1] - v1[1])
+            u0, u1 = cum / MODULE_M, (cum + edge) / MODULE_M
+            cum += edge
+            v_b, v_t = phase, phase + h_m / MODULE_M
+            uv_a, uv_b, uv_c, uv_d = (u0, v_b), (u1, v_b), (u0, v_t), (u1, v_t)
+            push(wall_pos, wall_nor, gl(v1), gl(v2), gl(v1t))
+            wall_uv.extend([uv_a, uv_b, uv_c])
+            push(wall_pos, wall_nor, gl(v2), gl(v2t), gl(v1t))
+            wall_uv.extend([uv_b, uv_d, uv_c])
+            wall_col.extend([tint] * 6)
+
+        # 屋顶 (环已在 2D 归一化为逆时针; gl 映射 z=-n 后 (a,b,c) 顺序法线朝 +Y)
+        for a, b, c in tris:
+            push(roof_pos, roof_nor, gl(ring_top[a]), gl(ring_top[b]), gl(ring_top[c]))
+            roof_col.extend([tint] * 3)
+
         for v in ring3d:
             max_e, max_n = max(max_e, v[0]), max(max_n, v[1])
             min_e, min_n = min(min_e, v[0]), min(min_n, v[1])
             max_u, min_u = max(max_u, top), min(min_u, base)
 
-    if not positions:
+    if not wall_pos:
         log("[-] 3D Tiles: 没有可挤出的建筑")
         return None, {"error": "no buildings"}
 
-    glb = build_glb(positions, normals)
+    materials = [
+        {"pbrMetallicRoughness": {           # 0 立面 (纹理)
+            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+            "baseColorTexture": {"index": 0},
+            "metallicFactor": 0.0, "roughnessFactor": 0.95},
+         "doubleSided": False},
+        {"pbrMetallicRoughness": {           # 1 屋顶 (素色)
+            "baseColorFactor": [0.545, 0.573, 0.596, 1.0],
+            "metallicFactor": 0.0, "roughnessFactor": 1.0},
+         "doubleSided": False},
+    ]
+    prims = [
+        {"positions": wall_pos, "normals": wall_nor, "uvs": wall_uv,
+         "colors": wall_col, "material": 0},
+        {"positions": roof_pos, "normals": roof_nor, "colors": roof_col, "material": 1},
+    ]
+    glb = build_glb(prims, materials, texture_png=make_facade_png())
     b3dm_path = os.path.join(out_dir, "scene.b3dm")
     with open(b3dm_path, "wb") as fh:
         fh.write(wrap_b3dm(glb))
@@ -777,6 +924,11 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
          padding:14px 16px;border-radius:10px;font:13px/1.7 system-ui,sans-serif;min-width:230px;}
   #panel h3{margin:0 0 8px;font-size:14px;}
   #panel label{display:block;cursor:pointer;}
+  #panel .presets{margin:6px 0 2px;display:flex;gap:6px;}
+  #panel .presets button{flex:1;background:#2c4a66;color:#dfeaf3;border:0;border-radius:6px;
+         padding:3px 0;font-size:12px;cursor:pointer;}
+  #panel .presets button:hover{background:#3a6288;}
+  #panel #layers label{margin-top:2px;}
   #panel .meta{color:#9ab;font-size:12px;margin-top:8px;border-top:1px solid #345;padding-top:8px;}
   #status{color:#fa0;}
 </style>
@@ -785,9 +937,12 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
 <div id="cesium"></div>
 <div id="panel">
   <h3>__NAME__</h3>
-  <label><input type="checkbox" id="ckGeo" checked> 建筑 GeoJSON 白模（可改样式）</label>
-  <label><input type="checkbox" id="ckTiles" checked> 建筑 3D Tiles（离线包）</label>
+  <label><input type="checkbox" id="ckTiles" checked> 建筑·纹理白模（3D Tiles 离线包）</label>
+  <label><input type="checkbox" id="ckGeo"> 白模·按高度配色（GeoJSON）</label>
   <label><input type="checkbox" id="ckAbs"> 绝对高程模式（接真实地形时勾选；默认贴地预览）</label>
+  <div class="presets">
+    <button data-p="tex" title="只看纹理 3D Tiles">纹理模式</button><button data-p="heat" title="只看按高度配色的 GeoJSON 白模">高度分析</button><button data-p="all" title="两层叠加">全部显示</button>
+  </div>
   <div id="layers"></div>
   <div class="meta">
     中心: __LON__, __LAT__<br>
@@ -800,6 +955,7 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
 <script>
 const LON=__LON__, LAT=__LAT__, RADIUS=__RADIUS__;
 const LON0=__LON__, LAT0=__LAT__, MEDBASE=__MEDBASE__;
+const EXTRAS_META = __EXTRAS__;   // {文件名: 要素数}
 Cesium.Ion.defaultAccessToken = undefined;
 const viewer = new Cesium.Viewer("cesium", {
   baseLayer: new Cesium.ImageryLayer(new Cesium.UrlTemplateImageryProvider({
@@ -894,6 +1050,7 @@ function styleGreen(ent){
         n++;
       }
       document.getElementById("cnt").textContent = n;
+      geoSrc.show = false;   // 默认看纹理 3D Tiles, GeoJSON 白模作高度分析用
       viewer.dataSources.add(geoSrc);
     } catch(e) { st.textContent = "GeoJSON 加载失败: " + e; }
 
@@ -902,7 +1059,7 @@ function styleGreen(ent){
       viewer.scene.primitives.add(tiles);
     } catch(e) { st.textContent = "3D Tiles 加载失败: " + e; }
 
-    // OSM 配套图层（存在才加载，动态生成开关）
+    // OSM 配套图层（存在才加载，动态生成开关 + 要素数）
     const EXTRAS = [
       { file: "roads.geojson",    label: "道路路网", style: styleRoad },
       { file: "railways.geojson", label: "铁路轨道", style: styleRail },
@@ -916,8 +1073,9 @@ function styleGreen(ent){
         for (const ent of ds.entities.values) L.style(ent);
         viewer.dataSources.add(ds);
         layerSrc[L.file] = ds;
+        const cnt = EXTRAS_META[L.file] != null ? ` (${EXTRAS_META[L.file]})` : "";
         const ck = document.createElement("label");
-        ck.innerHTML = `<input type="checkbox" checked data-f="${L.file}"> ${L.label}`;
+        ck.innerHTML = `<input type="checkbox" checked data-f="${L.file}"> ${L.label}${cnt}`;
         document.getElementById("layers").appendChild(ck);
       } catch(e) { /* 图层文件不存在则静默跳过 */ }
     }
@@ -926,15 +1084,28 @@ function styleGreen(ent){
       if (f && layerSrc[f]) layerSrc[f].show = e.target.checked;
     };
 
+    // 预设模式: 纹理 / 高度分析 / 全部
+    document.querySelectorAll("#panel .presets button").forEach(btn => {
+      btn.onclick = () => {
+        const p = btn.dataset.p;
+        document.getElementById("ckTiles").checked = (p !== "heat");
+        document.getElementById("ckGeo").checked = (p !== "tex");
+        if (tiles) tiles.show = (p !== "heat");
+        if (geoSrc) geoSrc.show = (p !== "tex");
+      };
+    });
+
     document.getElementById("ckGeo").onchange = e => { if(geoSrc) geoSrc.show = e.target.checked; };
     document.getElementById("ckTiles").onchange = e => { if(tiles) tiles.show = e.target.checked; };
     document.getElementById("ckAbs").onchange = e => applyMode(e.target.checked);
     applyMode(false);  // 默认贴地模式
 
+    // 初始视角: 42° 斜视, 更有三维感 (比正俯视好看)
     const dLat = RADIUS/111320, dLon = RADIUS/(111320*Math.cos(LAT*Math.PI/180));
     await viewer.camera.flyTo({
-      destination: Cesium.Rectangle.fromDegrees(LON-dLon*1.6, LAT-dLat*1.6, LON+dLon*1.6, LAT+dLat*1.6),
-      duration: 1.5
+      destination: Cesium.Cartesian3.fromDegrees(LON, LAT - dLat*1.35, RADIUS*1.9),
+      orientation: { heading: 0, pitch: Cesium.Math.toRadians(-42), roll: 0 },
+      duration: 1.8
     });
     if (st.textContent.indexOf("加载") === 0) st.textContent = "就绪 ✓（在线影像需可访问 arcgisonline.com）";
   } catch(e) { st.textContent = "初始化失败: " + e; }
@@ -949,10 +1120,11 @@ cd "$(dirname "$0")" && exec python3 -m http.server "${1:-8000}"
 """
 
 
-def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0):
+def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0, extras=None):
     html = (PREVIEW_TPL.replace("__NAME__", name).replace("__LON__", repr(lon))
             .replace("__LAT__", repr(lat)).replace("__RADIUS__", repr(radius_m))
-            .replace("__MEDBASE__", repr(round(float(median_base), 2))))
+            .replace("__MEDBASE__", repr(round(float(median_base), 2)))
+            .replace("__EXTRAS__", json.dumps(extras or {})))
     html_path = os.path.join(out_dir, "cesium_preview.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -1085,6 +1257,7 @@ def main():
     # 3. 建筑 + OSM 配套图层 (道路/铁路/水系/绿地)
     dem_sample = make_dem_sampler(dem_path)
     buildings_info = {}
+    extras_counts = {}
     if not args.skip_buildings:
         elements, used_ep = fetch_osm(w, s, e, n)
         if elements is None:
@@ -1114,6 +1287,7 @@ def main():
                         write_layer_geojson(fts, os.path.join(out_dir, f"{lname}.geojson"),
                                             (w, s, e, n), layer_labels[lname], {"unit": "要素"})
                 buildings_info["layers"] = layer_counts
+                extras_counts = {f"{k}.geojson": v for k, v in layer_counts.items()}
                 log(f"[*]   配套图层: " + ", ".join(f"{k} {v}" for k, v in layer_counts.items()))
 
             # 4. 3D Tiles
@@ -1128,7 +1302,7 @@ def main():
         if buildings_info.get("count"):
             bases = sorted(f["properties"]["base_m"] for f in feats)
             median_base = bases[len(bases) // 2]
-        write_preview(out_dir, name, lon0, lat0, ext_m / 2, median_base)
+        write_preview(out_dir, name, lon0, lat0, ext_m / 2, median_base, extras=extras_counts)
 
     report["outputs"]["buildings"] = buildings_info
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")

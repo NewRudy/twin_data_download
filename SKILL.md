@@ -13,8 +13,8 @@ description: 按坐标点一键下载数字孪生场景基础数据——高清�
 | 高程 DEM | Copernicus GLO-30 | 30m（标称） | GeoTIFF (EPSG:4326) |
 | 建筑物 | OpenStreetMap (Overpass) | 覆盖度不一（中国县城可能稀疏） | GeoJSON (EPSG:4326) + 属性高度 |
 | 道路/铁路/水系/绿地 | OpenStreetMap (Overpass, 同一次查询) | 覆盖随 OSM | 各自独立 GeoJSON |
-| 3D 白模 | 上述建筑挤出（含封闭屋顶） | 高度 POLICY 估算 | 3D Tiles 1.0 (b3dm + tileset.json) |
-| 预览页 | CesiumJS | 验收用 | cesium_preview.html + serve.sh |
+| 3D 白模 | 上述建筑挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗，按建筑类型调色） | 高度 POLICY 估算 | 3D Tiles 1.0 (b3dm + tileset.json) |
+| 预览页 | CesiumJS | 验收用 | cesium_preview.html + serve.sh，图层开关/纹理-高度预设/42° 斜视角 |
 
 另产出 `download_report.json`：记录数据源、瓦片数、失败数、高度估算占比等证据。
 
@@ -87,8 +87,10 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 <输出目录>/serve.sh          # 然后浏览器开 http://localhost:8000/cesium_preview.html
 ```
 
-预览页验证点：影像底图加载、建筑双图层 + 道路/铁路/水系/绿地图层都能显示（各自有开关）、
-右下角无红色报错；近景确认建筑**屋顶封闭**（白模顶面完整，不是空心管）。
+预览页验证点：影像底图加载、纹理 3D Tiles（默认）+ 高度分析白模预设切换、
+道路/铁路/水系/绿地图层显示、右下角无红色报错；陡视角(-60°)确认建筑**屋顶封闭**
+（白模顶面完整，不是空心管/凹盒）。可用 scripts/dissect_b3dm.py 解剖 b3dm 验证几何
+（屋顶法线朝上顶点应在楼顶高度、无贴地异常）。
 用 ego-browser 截图留证。
 
 ## 输出结构
@@ -145,11 +147,13 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 > 改动本 skill 后同步 `SKILL.md requirements.txt setup_env.sh scripts/download_scene.py` 到该仓库。
 
 - **2026-11-04 Rudy Mac**（上海小涞港示范区, shp zip 输入, 6km 框）：
-  多图层链路通过——roads 3230 / railways 333 / water 168 / green 123 独立 GeoJSON✓、
-  预览页 4 个动态图层开关+分级样式✓、建筑 1014 栋屋顶封闭✓
-  （GLB 解剖: 屋顶法线 y>0.5 顶点 10963 个, 修复前为 0）、
-  图层开关/贴地-绝对高程切换交互✓、页面零 JS 错误✓
-  （截图于 小涞港示范区_scene/acceptance/）。OSM 覆盖仍不均：非中心区大片住宅无建筑。
+  全链路复验——roads 3230 / railways 333 / water 168 / green 123✓、预览 4 图层开关+要素数✓、
+  预设模式切换✓、零 JS 错误✓。**屋顶 bug 修复**：此前屋顶画在楼底(楼顶敞口, doubleSided
+  材质下呈"凹进去的空盒")，修复后解剖确认屋顶 12192 顶点全部位于 3~53m 楼顶高度、
+  贴地异常 0；陡视角截图封闭平顶✓。**材质升级**：程序化立面纹理(窗格/亮灯窗/COLOR_0
+  类型调色)嵌入 b3dm(2.0MB)，近景窗格可见✓。教训：自写 GLB 解剖脚本曾漏跳 BIN chunk
+  8 字节头导致"验证通过"的假证据，现已固化为 scripts/dissect_b3dm.py（带 chunk 类型断言）。
+  截图于 小涞港示范区_scene/acceptance/2026-11-04-*.png。
 - **2026-11-03 Rudy Mac**（macOS, `~/.venv_imagery`, Cesium 1.142）：
   永新山区点（0 建筑→软跳过✓）+ 永新县城点全链路通过——影像 GeoTIFF✓、
   GLO-30 DEM✓（114-135m）、GeoJSON✓、3D Tiles 双图层渲染✓、z19 占位自动降级✓、

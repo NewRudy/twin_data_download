@@ -8,8 +8,8 @@
 | 高程 DEM | Copernicus GLO-30 | GeoTIFF (EPSG:4326)，标称 30m |
 | 建筑物 | OpenStreetMap（Overpass API） | GeoJSON（含高度估算） |
 | 道路/铁路/水系/绿地 | OpenStreetMap（同一次 Overpass 查询） | 各自独立 GeoJSON，"OSM 提供啥就提取啥" |
-| 3D 白模 | 由建筑轮廓挤出（封闭屋顶） | 3D Tiles 1.0（b3dm + tileset.json） |
-| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh，图层独立开关 |
+| 3D 白模 | 由建筑轮廓挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗/按建筑类型调色） | 3D Tiles 1.0（b3dm + tileset.json） |
+| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh；纹理模式/高度分析预设、图层开关、42° 斜视角 |
 | 下载报告 | — | download_report.json（数据源/瓦片数/失败数/各图层要素数） |
 
 建筑数据**有就生成、没有就跳过**：OSM 覆盖不到的位置自动跳过建筑与 3D Tiles，
@@ -47,8 +47,9 @@ cd <输出目录> && ./serve.sh
 # 浏览器打开 http://localhost:8000/cesium_preview.html
 ```
 
-预览页支持建筑双图层 + 道路/铁路/水系/绿地图层的独立开关（道路按等级分色分宽，
-水系线/面蓝色、绿地半透明），默认**贴地模式**；接真实地形渲染时勾选「绝对高程模式」。
+预览页默认**纹理模式**（3D Tiles 立面带窗格纹理）；「高度分析」切换为按高度配色的
+GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数），默认**贴地模式**+42° 斜视角；
+接真实地形渲染时勾选「绝对高程模式」。
 
 ## 输出结构
 
@@ -76,12 +77,16 @@ GeoJSON 白模可用 `extrudedHeight=top_m / height=base_m` 客户端挤出，�
 
 - **建筑高度是估算**（OSM `height` 标签 > 层数×3m > 默认 6m），每栋的依据记录在
   `properties.height_source`，不能当测绘成果用。
+- **立面纹理是程序化生成的**（窗格/亮灯窗按层高循环排布，非真实照片），
+  用于让白模有建筑感；真实立面需无人机倾斜摄影。
 - **OSM 建筑在中国基本不可用**：县城 3km 范围实测仅个位数建筑，省会密集城区也只有
   数十栋；Microsoft / Google 的全球建筑轮廓数据集均不覆盖中国。项目现场需要真实
   建筑请用无人机倾斜摄影或授权商业数据。
 - **ESRI z19+ 在县城/乡镇多为占位灰瓦片**（"Map data not yet available"），
   本工具会自动探测并降级到有真实影像的层级。
 - 分辨率为按纬度换算的估算值；DEM 30m 适合做场景地形底座，非测绘级。
+- 几何验证工具：`python3 scripts/dissect_b3dm.py <scene.b3dm>` 可解剖 b3dm，
+  校验屋顶法线朝上且位于楼顶高度（曾据此发现并修复屋顶画在楼底的 bug）。
 
 ## 数据源致谢与使用边界
 
