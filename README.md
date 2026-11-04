@@ -28,9 +28,12 @@ bash setup_env.sh                      # 创建 ~/.venv_imagery 并装依赖（�
 常用参数：
 
 ```bash
---zoom 17            # 1.2m，更快（16-19；ESRI 无影像层级会自动探测降级）
---source google      # Google 影像源（国内需代理）
---skip-buildings     # 只要影像和高程
+--geojson 场址边界.geojson --buffer 500
+                      # 按 GeoJSON 边界下载(Point/Polygon/FeatureCollection 均可,
+                      # 取包围盒; --buffer 向外扩米数), 范围过大/过小会提示
+--zoom 17             # 1.2m，更快（16-19；ESRI 无影像层级会自动探测降级）
+--source google       # Google 影像源（国内需代理）
+--skip-buildings      # 只要影像和高程
 --skip-3dtiles --skip-preview
 --name 场景名 --out 输出目录
 ```

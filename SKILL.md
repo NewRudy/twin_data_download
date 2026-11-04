@@ -38,6 +38,9 @@ bash ~/skills/gis-data-download/setup_env.sh
 常用变体：
 
 ```bash
+# 按 GeoJSON 边界下载 (Point/Polygon/FeatureCollection 均可, 取包围盒; --buffer 向外扩米数)
+... --geojson 场址边界.geojson --buffer 500
+
 # 更小分辨率更快出结果（z17 = 1.2m）
 ... --zoom 17 --radius 2000
 
@@ -52,8 +55,13 @@ http_proxy=http://127.0.0.1:58309 https_proxy=http://127.0.0.1:58309 all_proxy= 
 ... --skip-imagery --skip-dem
 ```
 
-参数：`--zoom 16-19`、`--radius` 米、`--name 场景名`、`--out 输出目录`、
+参数：`--zoom 16-19`、`--radius` 米、`--geojson 边界文件`、`--buffer` 外扩米、
+`--name 场景名`、`--out 输出目录`、
 `--workers 并发数`、`--default-height`（无标签建筑默认高度，默认 6m）。
+
+**范围确认（必做）**：输出或 `download_report.json` 的 `warnings` 里若有
+「范围很小 / 范围较大 / 范围过大」提示，**先把提示转述给用户、确认合适后再继续**
+（小范围建议 `--buffer` 外扩；>6km 建议降 zoom 或分块；>12km 强烈建议分块）。
 
 ### 3. 验收
 
@@ -123,6 +131,9 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 - 产线环境（投标/汇报）引用这些数据时，按 [[evidence-boundary]] 标注层级，别说成"测绘级"。
 
 ## 已验证机器
+
+> 发布副本（其他机器直接 clone 用）：https://github.com/NewRudy/twin_data_download
+> 改动本 skill 后同步 `SKILL.md requirements.txt setup_env.sh scripts/download_scene.py` 到该仓库。
 
 - **2026-11-03 Rudy Mac**（macOS, `~/.venv_imagery`, Cesium 1.142）：
   永新山区点（0 建筑→软跳过✓）+ 永新县城点全链路通过——影像 GeoTIFF✓、

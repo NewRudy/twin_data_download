@@ -82,6 +82,45 @@ def bbox_from_center(lon, lat, radius_m):
     return lon - d_lon, lat - d_lat, lon + d_lon, lat + d_lat  # w, s, e, n
 
 
+def geojson_bbox(path, buffer_m=0.0):
+    """从 GeoJSON 文件取所有坐标的包围盒。支持 Point/Line/Polygon/Multi*/Feature/FC。"""
+    def walk(obj, acc):
+        if isinstance(obj, (int, float)) and not isinstance(obj, bool):
+            acc.append(obj)
+            return
+        if isinstance(obj, list):
+            if len(obj) >= 2 and isinstance(obj[0], (int, float)) and isinstance(obj[1], (int, float)) \
+                    and not isinstance(obj[0], bool):
+                acc.extend([obj[0], obj[1]])
+                return
+            for item in obj:
+                walk(item, acc)
+
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    acc = []
+    walk(data.get("coordinates") if data.get("type") != "FeatureCollection"
+         else data, acc)
+    # FeatureCollection: 递归进每个 feature 的 geometry
+    if data.get("type") == "FeatureCollection":
+        acc = []
+        for feat in data.get("features", []):
+            sub = []
+            walk(feat.get("geometry", {}).get("coordinates"), sub)
+            acc.extend(sub)
+    elif data.get("type") == "Feature":
+        sub = []
+        walk(data.get("geometry", {}).get("coordinates"), sub)
+        acc = sub
+    if not acc:
+        raise ValueError("GeoJSON 中没有找到坐标")
+    xs, ys = acc[0::2], acc[1::2]
+    w, e, s, n = min(xs), max(xs), min(ys), max(ys)
+    d_lat = buffer_m / 111320.0
+    d_lon = buffer_m / (111320.0 * math.cos(math.radians((s + n) / 2)))
+    return w - d_lon, s - d_lat, e + d_lon, n + d_lat
+
+
 def geodetic_to_ecef(lon, lat, h=0.0):
     a, f = 6378137.0, 1 / 298.257223563
     e2 = f * (2 - f)
@@ -163,17 +202,17 @@ def triangulate_ring(ring):
 
 # ---------------------------------------------------------------- 1. 影像
 
-def download_imagery(lon, lat, radius_m, zoom, source, out_path, workers=12):
-    w, s, e, n = bbox_from_center(lon, lat, radius_m)
+def download_imagery(w, s, e, n, zoom, source, out_path, workers=12):
     tiles = list(mercantile.tiles(w, s, e, n, zooms=zoom))
     if not tiles:
         log("[-] 影像: 未找到瓦片")
         return None, {}
 
+    lat_mid = (s + n) / 2
     min_x, max_x = min(t.x for t in tiles), max(t.x for t in tiles)
     min_y, max_y = min(t.y for t in tiles), max(t.y for t in tiles)
     cols, rows = max_x - min_x + 1, max_y - min_y + 1
-    res = 156543.03 * math.cos(math.radians(lat)) / (2 ** zoom)
+    res = 156543.03 * math.cos(math.radians(lat_mid)) / (2 ** zoom)
     url_t = GOOGLE_URL if source == "google" else ESRI_URL
 
     log(f"[*] 影像: zoom {zoom} (~{res:.2f} m/px 估算), 网格 {cols}x{rows}={len(tiles)} 瓦片, 源={source}")
@@ -707,9 +746,12 @@ def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0):
 def main():
     global DEFAULT_HEIGHT
     ap = argparse.ArgumentParser(description="数字孪生场景基础数据一站式下载 (影像+高程+建筑+3D Tiles+预览)")
-    ap.add_argument("--lon", type=float, required=True, help="中心经度 (WGS84)")
-    ap.add_argument("--lat", type=float, required=True, help="中心纬度 (WGS84)")
-    ap.add_argument("--radius", type=float, default=1500.0, help="半径米数 (默认 1500, 即 3km x 3km)")
+    ap.add_argument("--lon", type=float, default=None, help="中心经度 (WGS84); 与 --geojson 二选一")
+    ap.add_argument("--lat", type=float, default=None, help="中心纬度 (WGS84); 与 --geojson 二选一")
+    ap.add_argument("--geojson", type=str, default=None,
+                    help="边界 GeoJSON 文件 (Point/Line/Polygon/Multi*/Feature/FeatureCollection), 按其包围盒下载")
+    ap.add_argument("--buffer", type=float, default=0.0, help="--geojson 时向外扩展的米数 (默认 0)")
+    ap.add_argument("--radius", type=float, default=1500.0, help="半径米数 (默认 1500, 即 3km x 3km); --geojson 时忽略")
     ap.add_argument("--zoom", type=int, choices=[16, 17, 18, 19], default=18,
                     help="影像缩放级别 17=1.2m 18=0.6m 19=0.3m (分辨率均为估算)")
     ap.add_argument("--source", choices=["esri", "google"], default="esri",
@@ -728,21 +770,58 @@ def main():
 
     DEFAULT_HEIGHT = args.default_height
 
-    name = args.name or f"scene_{args.lon:.4f}_{args.lat:.4f}"
+    if args.geojson:
+        w, s, e, n = geojson_bbox(args.geojson, buffer_m=args.buffer)
+        lon0, lat0 = (w + e) / 2, (s + n) / 2
+        ext_m = max((e - w) * 111320.0 * math.cos(math.radians(lat0)), (n - s) * 110540.0)
+        name = args.name or (os.path.splitext(os.path.basename(args.geojson))[0] or "scene_geojson")
+        src_desc = (f"GeoJSON 边界: {os.path.basename(args.geojson)}"
+                    + (f" (外扩 {args.buffer:.0f}m)" if args.buffer else ""))
+    else:
+        if args.lon is None or args.lat is None:
+            ap.error("必须提供 --lon/--lat 或 --geojson 之一")
+        lon0, lat0 = args.lon, args.lat
+        w, s, e, n = bbox_from_center(lon0, lat0, args.radius)
+        ext_m = args.radius * 2
+        name = args.name or f"scene_{lon0:.4f}_{lat0:.4f}"
+        src_desc = (f"中心 ({lon0:.6f}, {lat0:.6f}), 半径 {args.radius}m "
+                    f"(约 {args.radius*2/1000:.1f}km x {args.radius*2/1000:.1f}km)")
+
     out_dir = args.out or f"{name}_scene"
     os.makedirs(out_dir, exist_ok=True)
-    w, s, e, n = bbox_from_center(args.lon, args.lat, args.radius)
     started = datetime.datetime.now().isoformat(timespec="seconds")
 
     log("=" * 62)
     log(f"    数字孪生场景基础数据下载 — {name}")
     log("=" * 62)
-    log(f"[*] 中心 ({args.lon:.6f}, {args.lat:.6f}), 半径 {args.radius}m "
-        f"(约 {args.radius*2/1000:.1f}km x {args.radius*2/1000:.1f}km)")
+    log(f"[*] {src_desc}")
+    log(f"[*] 覆盖范围: {w:.5f},{s:.5f} ~ {e:.5f},{n:.5f} "
+        f"(约 {(e-w)*111320*math.cos(math.radians(lat0))/1000:.1f}km x {(n-s)*110540/1000:.1f}km)")
     log(f"[*] 输出目录: {os.path.abspath(out_dir)}")
 
-    report = {"command": vars(args), "name": name, "center_wgs84": [args.lon, args.lat],
-              "radius_m": args.radius, "bbox_wgs84": [round(v, 6) for v in (w, s, e, n)],
+    # 范围合理性提示 (太大/太小), 写入 report["warnings"], 由 agent 向用户确认
+    warnings = []
+    tile_w_m = 156543.03 * math.cos(math.radians(lat0)) / (2 ** args.zoom) * 256  # 单瓦片地面宽(m)
+    est_cols = max(1, math.ceil((e - w) * 111320.0 * math.cos(math.radians(lat0)) / tile_w_m))
+    est_rows = max(1, math.ceil((n - s) * 110540.0 / tile_w_m))
+    est_tiles = est_cols * est_rows
+    size_km = ext_m / 1000.0
+    if ext_m < 100:
+        warnings.append(f"范围很小 (约 {ext_m:.0f}m): 瓦片极少, 若本意是下载周边区域, 请用 --buffer 外扩或改用 --lon/--lat --radius")
+    if size_km > 12:
+        warnings.append(f"范围过大 (约 {size_km:.1f}km): z{args.zoom} 预计 {est_tiles} 瓦片, 下载慢且易被限流; 强烈建议分块下载或降低 --zoom")
+    elif size_km > 6:
+        warnings.append(f"范围较大 (约 {size_km:.1f}km): z{args.zoom} 预计约 {est_tiles} 瓦片、GeoTIFF 可能几百 MB; 建议 --zoom 17, 或 --skip-buildings 减负")
+    for msg in warnings:
+        log(f"[!] {msg}")
+    if warnings:
+        log("[!] 请确认范围是否合适后继续 (Ctrl+C 可中止)")
+
+    report = {"command": vars(args), "name": name,
+              "center_wgs84": [round(lon0, 6), round(lat0, 6)],
+              "extent_m": round(ext_m, 1),
+              "bbox_wgs84": [round(v, 6) for v in (w, s, e, n)],
+              "warnings": warnings,
               "started": started, "evidence_note":
               "影像/DEM 分辨率为数据源标称或 MODELED 估算; 建筑高度为 POLICY 估算; "
               "建筑覆盖依赖 OSM 完整度 (中国县城可能稀疏)。非测绘级成果, 仅供场景搭建参考。",
@@ -752,10 +831,10 @@ def main():
     # 直接下载会得到灰色马赛克。先探测, 占位则自动降级。
     if args.source == "esri" and not args.skip_imagery and args.zoom >= 19:
         log(f"[*] 探测 ESRI z{args.zoom} 中心瓦片是否为真实影像 ...")
-        if not probe_esri_tile(args.zoom, args.lon, args.lat):
+        if not probe_esri_tile(args.zoom, lon0, lat0):
             z = args.zoom - 1
             log(f"[!] ESRI z{args.zoom} 在此区域是占位灰瓦片 (无真实影像), 自动降级 z{z}")
-            while z >= 16 and not probe_esri_tile(z, args.lon, args.lat):
+            while z >= 16 and not probe_esri_tile(z, lon0, lat0):
                 log(f"[!] z{z} 仍是占位, 继续降级")
                 z -= 1
             args.zoom = z
@@ -764,7 +843,7 @@ def main():
 
     # 1. 影像
     if not args.skip_imagery:
-        p, info = download_imagery(args.lon, args.lat, args.radius, args.zoom,
+        p, info = download_imagery(w, s, e, n, args.zoom,
                                    args.source, os.path.join(out_dir, f"imagery_z{args.zoom}_{args.source}.tif"),
                                    workers=args.workers)
         report["outputs"]["imagery"] = info
@@ -799,7 +878,7 @@ def main():
 
             # 4. 3D Tiles
             if not args.skip_3dtiles and feats:
-                _, tiles_info = write_3dtiles(feats, args.lon, args.lat,
+                _, tiles_info = write_3dtiles(feats, lon0, lat0,
                                               os.path.join(out_dir, "buildings_3dtiles"), dem_info)
                 buildings_info["3d_tiles"] = tiles_info
 
@@ -809,7 +888,7 @@ def main():
         if buildings_info.get("count"):
             bases = sorted(f["properties"]["base_m"] for f in feats)
             median_base = bases[len(bases) // 2]
-        write_preview(out_dir, name, args.lon, args.lat, args.radius, median_base)
+        write_preview(out_dir, name, lon0, lat0, ext_m / 2, median_base)
 
     report["outputs"]["buildings"] = buildings_info
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
