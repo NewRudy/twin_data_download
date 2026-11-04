@@ -55,13 +55,18 @@ http_proxy=http://127.0.0.1:58309 https_proxy=http://127.0.0.1:58309 all_proxy= 
 # 只要建筑数据（影像/DEM 已有）
 ... --skip-imagery --skip-dem
 
+# 断点续传: 复用输出目录已有的影像/DEM/建筑/配套图层, 跳过全部网络下载,
+# 只重做 3D Tiles / 预览页 / 报告 (改完模板或参数后重出交付物用这个, 秒级)
+... --resume
+
 # 不要道路/水系/绿地配套图层
 ... --skip-extras
 ```
 
 参数：`--zoom 16-19`、`--radius` 米、`--geojson 边界文件`、`--buffer` 外扩米、
 `--name 场景名`、`--out 输出目录`、
-`--workers 并发数`、`--default-height`（无标签建筑默认高度，默认 6m）。
+`--workers 并发数`、`--default-height`（无标签建筑默认高度，默认 6m）、
+`--tile-threshold`（建筑数超过该值 3D Tiles 自动分块，默认 1500）。
 
 **范围确认（必做）**：输出或 `download_report.json` 的 `warnings` 里若有
 「范围很小 / 范围较大 / 范围过大」提示，**先把提示转述给用户、确认合适后再继续**
@@ -106,7 +111,7 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 ├── green.geojson             # 绿地（公园/草坪/林地/球场 Polygon）
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF transform, Cesium 直接加载
-│   └── scene.b3dm
+│   ├── scene.b3dm            # ≤1500 栋: 单 tile；更多时改为 tiles/cell_*.b3dm 分块 (~350 栋/块)
 ├── cesium_preview.html       # 多图层预览（建筑/路网/水系/绿地独立开关）
 ├── serve.sh                  # python3 -m http.server 封装
 └── download_report.json      # 证据记录（含各图层要素数）
@@ -144,8 +149,22 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 ## 已验证机器
 
 > 发布副本（其他机器直接 clone 用）：https://github.com/NewRudy/twin_data_download
-> 改动本 skill 后同步 `SKILL.md requirements.txt setup_env.sh scripts/download_scene.py` 到该仓库。
+> 改动本 skill 后同步 `SKILL.md requirements.txt setup_env.sh scripts/download_scene.py scripts/dissect_b3dm.py` 到该仓库。
 
+- **2026-11-05 Rudy Mac**（上海小涞港示范区）：
+  **断点续传 `--resume`**：复用已有影像/DEM/建筑/配套图层、跳过 Overpass，只重做
+  3D Tiles/预览/报告，全程无网络请求秒级完成✓（配套图层计数取自已有文件）。
+  **3D Tiles 分块 LOD**：>1500 栋自动按质心均匀网格分块（~350 栋/块，
+  tiles/cell_XX_YY.b3dm + 根 tileset 并集包围盒），压阈值到 100 对同一场景出 2×2=4 块
+  浏览器验证：4/4 块加载、1014 栋全部渲染、位置与影像对齐✓（单 tile 路径回归一致✓；
+  教训：测试时中心坐标手打错一位（31.1807→31.8071）导致包围盒漂移 68km、建筑被视锥剔除，
+  症状是"加载了但全黑"，先核对坐标再怀疑代码）。
+  **配套图层 bug 修复**：水系/绿地面要素的 fromDegreesArray 被传入嵌套数组
+  （RangeError: Invalid array length），被 per-layer try/catch 静默吞掉导致开关消失；
+  改为正确遍历 Polygon 外环后 4 图层齐全✓（教训：图层加载失败不该静默，
+  至少 console.warn 并在面板标注失败）。另：道路 corridor 宽度/透明度按等级调优
+  （motorway 26m/0.6 → service 3.5m/0.8）、日照滑块默认 10:30、搜索飞行+信息卡属性展开。
+  截图于 小涞港示范区_scene/acceptance/2026-11-05-*.png。
 - **2026-11-04 Rudy Mac**（上海小涞港示范区, shp zip 输入, 6km 框）：
   全链路复验——roads 3230 / railways 333 / water 168 / green 123✓、预览 4 图层开关+要素数✓、
   预设模式切换✓、零 JS 错误✓。**屋顶 bug 修复**：此前屋顶画在楼底(楼顶敞口, doubleSided

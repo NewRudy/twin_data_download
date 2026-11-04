@@ -8,8 +8,8 @@
 | 高程 DEM | Copernicus GLO-30 | GeoTIFF (EPSG:4326)，标称 30m |
 | 建筑物 | OpenStreetMap（Overpass API） | GeoJSON（含高度估算） |
 | 道路/铁路/水系/绿地 | OpenStreetMap（同一次 Overpass 查询） | 各自独立 GeoJSON，"OSM 提供啥就提取啥" |
-| 3D 白模 | 由建筑轮廓挤出（封闭屋顶 + 程序化立面纹理：窗格/亮灯窗/按建筑类型调色；逐栋 batchId） | 3D Tiles 1.0（b3dm + tileset.json + batch table） |
-| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh；悬停/单击高亮拾取+信息卡、纹理/高度预设、图层开关、42° 斜视角 |
+| 3D 白模 | 由建筑轮廓挤出（封闭屋顶 + 女儿墙 + 屋顶设备盒 + 程序化立面纹理：窗格/亮灯窗/按建筑类型调色；逐栋 batchId；>1500 栋自动分块 LOD） | 3D Tiles 1.0（b3dm + tileset.json + batch table） |
+| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh；悬停/单击高亮拾取+信息卡、按名称搜索飞行、日照时间滑块、道路/铁路/水系/绿地独立开关（真实米宽走廊）、42° 斜视角 |
 | 下载报告 | — | download_report.json（数据源/瓦片数/失败数/各图层要素数） |
 
 建筑数据**有就生成、没有就跳过**：OSM 覆盖不到的位置自动跳过建筑与 3D Tiles，
@@ -37,6 +37,8 @@ bash setup_env.sh                      # 创建 ~/.venv_imagery 并装依赖（�
 --skip-buildings      # 只要影像和高程
 --skip-extras         # 不要道路/铁路/水系/绿地配套图层
 --skip-3dtiles --skip-preview
+--resume              # 断点续传: 复用已有产物, 跳过网络下载, 只重做 3D Tiles/预览/报告
+--tile-threshold 1500 # 建筑数超过该值 3D Tiles 自动网格分块 (~350 栋/块)
 --name 场景名 --out 输出目录
 ```
 
@@ -64,7 +66,7 @@ GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数）
 ├── green.geojson             # 绿地（公园/草坪/林地/球场）
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF，Cesium 直接加载
-│   └── scene.b3dm
+│   └── scene.b3dm            # ≤1500 栋单 tile；更多时为 tiles/cell_*.b3dm 分块
 ├── cesium_preview.html
 ├── serve.sh
 └── download_report.json      # 证据记录

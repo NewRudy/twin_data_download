@@ -17,6 +17,7 @@ import argparse
 import base64
 import concurrent.futures
 import datetime
+import glob
 import io
 import json
 import math
@@ -800,15 +801,28 @@ def wrap_b3dm(glb, batch_table=None, batch_length=0):
 MODULE_M = 3.0  # 纹理模块对应实地 3m (窗宽/层高)
 
 
-def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
-    """建筑挤出为单 tile b3dm + tileset.json。坐标系: tile 局部 ENU(z-up)。
+_BT_KEYS = ("osm_id", "name", "building", "height_m", "top_m",
+            "levels", "amenity", "addr", "area_m2_est", "height_source")
+_MATS = [
+    {"pbrMetallicRoughness": {           # 0 立面 (纹理)
+        "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
+        "baseColorTexture": {"index": 0},
+        "metallicFactor": 0.0, "roughnessFactor": 0.95},
+     "doubleSided": False},
+    {"pbrMetallicRoughness": {           # 1 屋顶 (素色)
+        "baseColorFactor": [0.545, 0.573, 0.596, 1.0],
+        "metallicFactor": 0.0, "roughnessFactor": 1.0},
+     "doubleSided": False},
+]
 
-    双材质: 墙面 = 程序化立面纹理(REPEAT, 按层高循环, COLOR_0 按建筑类型调色),
-    屋顶 = 素色深灰。单栋一次生成, 随机 v 相位让亮灯窗错落。
+
+def _building_prims(feats, lon0, lat0, rnd):
+    """建筑挤出几何: 墙面(立面纹理 UV + 类型调色) / 封闭屋顶 / 女儿墙 / 屋顶设备盒。
+
+    单 tile 与分块两条路径共用。返回 (prims, batch_table, bounds, skipped);
+    bounds=(min_e, min_n, max_e, max_n, min_u, max_u) 为 ENU 局部米,
+    batch_table 键序 = _BT_KEYS, 与 batchId 0..N-1 对齐; 无可挤出建筑时 prims=None。
     """
-    import random as _random
-    os.makedirs(out_dir, exist_ok=True)
-    rnd = _random.Random(20261104)
     wall_pos, wall_nor, wall_uv, wall_col, wall_bids = [], [], [], [], []
     roof_pos, roof_nor, roof_col, roof_bids = [], [], [], []
     max_e = max_n = max_u = -1e18
@@ -875,68 +889,208 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
             roof_col.extend([tint] * 3)
             roof_bids.extend([bid] * 3)
 
+        # 女儿墙: 檐口再起 0.7m, 顶盖内收 0.8m (小建筑跳过)
+        cx = sum(e for e, _ in ring2d) / len(ring2d)
+        cy = sum(n for _, n in ring2d) / len(ring2d)
+        dmin = min(math.hypot(cx - e, cy - n) for e, n in ring2d)
+        if dmin > 2.5:
+            PARA_H, INSET = 0.7, 0.8
+            ptop = top + PARA_H
+            ring_p = [(e, n, ptop) for e, n in ring2d]
+            inner2d = []
+            for e, n in ring2d:
+                d = math.hypot(cx - e, cy - n) or 1.0
+                k = max(0.0, (d - INSET) / d)
+                inner2d.append((cx + (e - cx) * k, cy + (n - cy) * k))
+            ring_i = [(e, n, ptop) for e, n in inner2d]
+            for i in range(m):
+                o1, o2 = ring_p[i], ring_p[(i + 1) % m]
+                i1, i2 = ring_i[i], ring_i[(i + 1) % m]
+                # 外立面 (同墙面绕序)
+                push(roof_pos, roof_nor, gl(ring_top[i]), gl(ring_top[(i + 1) % m]), gl(o1))
+                push(roof_pos, roof_nor, gl(ring_top[(i + 1) % m]), gl(o2), gl(o1))
+                # 顶盖 (外→外→内 CCW)
+                push(roof_pos, roof_nor, gl(o1), gl(o2), gl(i2))
+                push(roof_pos, roof_nor, gl(o1), gl(i2), gl(i1))
+                roof_col.extend([tint] * 12)
+                roof_bids.extend([bid] * 12)
+
+        # 屋顶设备盒: 大屋顶随机放 1-4 个 (水箱/机房/空调组)
+        area_est = p.get("area_m2_est") or 0
+        if area_est > 800:
+            es = [v[0] for v in ring2d], [v[1] for v in ring2d]
+            e0, e1, n0, n1 = min(es[0]), max(es[0]), min(es[1]), max(es[1])
+            for _ in range(min(4, max(1, int(area_est // 900)))):
+                bw, bl = rnd.uniform(3, 7), rnd.uniform(3, 7)
+                if (e1 - e0) < bw * 2.4 or (n1 - n0) < bl * 2.4:
+                    continue
+                bx0 = rnd.uniform(e0 + bw, e1 - bw * 2)
+                by0 = rnd.uniform(n0 + bl, n1 - bl * 2)
+                bh = rnd.uniform(1.8, 3.2)
+                bcorner = [(bx0, by0), (bx0 + bw, by0), (bx0 + bw, by0 + bl), (bx0, by0 + bl)]
+                bb = [(e, n, top) for e, n in bcorner]
+                bt = [(e, n, top + bh) for e, n in bcorner]
+                for i in range(4):  # 四面
+                    j = (i + 1) % 4
+                    push(roof_pos, roof_nor, gl(bb[i]), gl(bb[j]), gl(bt[i]))
+                    push(roof_pos, roof_nor, gl(bb[j]), gl(bt[j]), gl(bt[i]))
+                    roof_col.extend([tint] * 6)
+                    roof_bids.extend([bid] * 6)
+                for a, b, c in ((0, 1, 2), (0, 2, 3)):  # 顶盖
+                    push(roof_pos, roof_nor, gl(bt[a]), gl(bt[b]), gl(bt[c]))
+                    roof_col.extend([tint] * 3)
+                    roof_bids.extend([bid] * 3)
+
         for v in ring3d:
             max_e, max_n = max(max_e, v[0]), max(max_n, v[1])
             min_e, min_n = min(min_e, v[0]), min(min_n, v[1])
             max_u, min_u = max(max_u, top), min(min_u, base)
 
     if not wall_pos:
-        log("[-] 3D Tiles: 没有可挤出的建筑")
-        return None, {"error": "no buildings"}
-
-    materials = [
-        {"pbrMetallicRoughness": {           # 0 立面 (纹理)
-            "baseColorFactor": [1.0, 1.0, 1.0, 1.0],
-            "baseColorTexture": {"index": 0},
-            "metallicFactor": 0.0, "roughnessFactor": 0.95},
-         "doubleSided": False},
-        {"pbrMetallicRoughness": {           # 1 屋顶 (素色)
-            "baseColorFactor": [0.545, 0.573, 0.596, 1.0],
-            "metallicFactor": 0.0, "roughnessFactor": 1.0},
-         "doubleSided": False},
-    ]
+        return None, None, None, skipped
     prims = [
         {"positions": wall_pos, "normals": wall_nor, "uvs": wall_uv,
          "colors": wall_col, "batchids": wall_bids, "material": 0},
         {"positions": roof_pos, "normals": roof_nor, "colors": roof_col,
          "batchids": roof_bids, "material": 1},
     ]
-    glb = build_glb(prims, materials, texture_png=make_facade_png())
-    # batch table: 逐栋属性, 供 Cesium 拾取显示 (对标 map3d 信息卡)
-    batch_table = {
-        k: [pp.get(k, "") for pp in picked_props]
-        for k in ("osm_id", "name", "building", "height_m", "top_m",
-                  "levels", "amenity", "addr", "area_m2_est", "height_source")
-    }
-    b3dm_path = os.path.join(out_dir, "scene.b3dm")
-    with open(b3dm_path, "wb") as fh:
-        fh.write(wrap_b3dm(glb, batch_table=batch_table, batch_length=len(picked_props)))
+    batch_table = {k: [pp.get(k, "") for pp in picked_props] for k in _BT_KEYS}
+    bounds = (min_e, min_n, max_e, max_n, min_u, max_u)
+    return prims, batch_table, bounds, skipped
 
+
+def _write_tile_b3dm(prims, batch_table, path, tex):
+    glb = build_glb(prims, _MATS, texture_png=tex)
+    with open(path, "wb") as fh:
+        fh.write(wrap_b3dm(glb, batch_table=batch_table,
+                           batch_length=len(batch_table["osm_id"])))
+
+
+def _enu_box(bounds):
+    """bounds → glTF y-up 局部包围盒 (x=e, y=up, z=-n), 外扩 20m。"""
+    min_e, min_n, max_e, max_n, min_u, max_u = bounds
     pad = 20.0
-    umid = (min_u + max_u) / 2
-    box = [0, 0, umid,
-           (max_e - min_e) / 2 + pad, 0, 0,
-           0, (max_n - min_n) / 2 + pad, 0,
-           0, 0, (max_u - min_u) / 2 + pad]
+    return [(min_e + max_e) / 2, (min_u + max_u) / 2, -(min_n + max_n) / 2,
+            (max_e - min_e) / 2 + pad, 0, 0,
+            0, (max_u - min_u) / 2 + pad, 0,
+            0, 0, (max_n - min_n) / 2 + pad]
+
+
+def write_3dtiles(feats, lon0, lat0, out_dir, dem_info, tile_threshold=1500):
+    """建筑挤出为 3D Tiles (tileset.json + b3dm), 坐标系 ENU(z-up)。
+
+    ≤ tile_threshold 栋 → 单 tile scene.b3dm; 更大场景按质心均匀网格分块
+    (tiles/cell_XX_YY.b3dm, 约 350 栋/块, 网格 ≤16×16), 避免单个 b3dm 过大
+    无法流式加载。双材质: 墙面 = 程序化立面纹理 (REPEAT 按层高循环,
+    COLOR_0 按建筑类型调色), 屋顶 = 素色深灰; 逐栋 batchId + batch table。
+    """
+    import random as _random
+    os.makedirs(out_dir, exist_ok=True)
+    tex = make_facade_png()
+    cand = [f for f in feats if len(f["geometry"]["coordinates"][0]) >= 4]
+
+    if len(cand) <= tile_threshold:            # ---- 单 tile (默认路径)
+        rnd = _random.Random(20261104)
+        prims, batch_table, bounds, skipped = _building_prims(cand, lon0, lat0, rnd)
+        if prims is None:
+            log("[-] 3D Tiles: 没有可挤出的建筑")
+            return None, {"error": "no buildings"}
+        b3dm_path = os.path.join(out_dir, "scene.b3dm")
+        _write_tile_b3dm(prims, batch_table, b3dm_path, tex)
+        tileset = {
+            "asset": {"version": "1.0", "generator": "gis-data-download/1.2"},
+            "geometricError": 1000,
+            "root": {
+                "transform": enu_to_ecef_matrix(lon0, lat0, 0.0),
+                "boundingVolume": {"box": _enu_box(bounds)},
+                "geometricError": 0,
+                "refine": "REPLACE",
+                "content": {"uri": "scene.b3dm"},
+            },
+        }
+        ts_path = os.path.join(out_dir, "tileset.json")
+        with open(ts_path, "w", encoding="utf-8") as fh:
+            json.dump(tileset, fh, indent=2)
+        size_mb = os.path.getsize(b3dm_path) / 1048576
+        log(f"[✓] 3D Tiles: {ts_path}  (单 tile, b3dm {size_mb:.1f} MB, "
+            f"{len(feats) - skipped} 栋, 跳过 {skipped})")
+        info = {"buildings": len(feats) - skipped, "skipped": skipped,
+                "b3dm_mb": round(size_mb, 2), "tiles": 1,
+                "format": "3D Tiles 1.0 / b3dm, ENU 局部坐标系",
+                "dem_base": bool(dem_info)}
+        return ts_path, info
+
+    # ---- 分块路径: 质心均匀网格, 每格独立 b3dm + batch table (batchId 从 0 重排)
+    cents = []
+    for f in cand:
+        ring = f["geometry"]["coordinates"][0][:-1] or f["geometry"]["coordinates"][0]
+        es = ns = 0.0
+        for x, y in ring:
+            ee, nn = project_enu(x, y, lon0, lat0)
+            es += ee
+            ns += nn
+        cents.append((es / len(ring), ns / len(ring)))
+    nb = len(cand)
+    grid = max(1, min(16, math.ceil(math.sqrt(nb / 350.0))))
+    min_ce = min(c[0] for c in cents)
+    max_ce = max(c[0] for c in cents)
+    min_cn = min(c[1] for c in cents)
+    max_cn = max(c[1] for c in cents)
+    we = max((max_ce - min_ce) / grid, 1.0)
+    wn = max((max_cn - min_cn) / grid, 1.0)
+    cells = {}
+    for f, (ce, cn) in zip(cand, cents):
+        ix = min(grid - 1, int((ce - min_ce) / we))
+        iy = min(grid - 1, int((cn - min_cn) / wn))
+        cells.setdefault((ix, iy), []).append(f)
+    tdir = os.path.join(out_dir, "tiles")
+    os.makedirs(tdir, exist_ok=True)
+    children = []
+    u_box = None
+    total_mb = 0.0
+    total_skipped = 0
+    for ix, iy in sorted(cells):
+        rnd = _random.Random(20261104 + ix * 131 + iy)
+        prims, bt, bounds, sk = _building_prims(cells[(ix, iy)], lon0, lat0, rnd)
+        total_skipped += sk
+        if prims is None:
+            continue
+        name = f"cell_{ix:02d}_{iy:02d}.b3dm"
+        _write_tile_b3dm(prims, bt, os.path.join(tdir, name), tex)
+        total_mb += os.path.getsize(os.path.join(tdir, name)) / 1048576
+        cbox = _enu_box(bounds)
+        children.append({"boundingVolume": {"box": cbox},
+                         "geometricError": 0,
+                         "content": {"uri": f"tiles/{name}"}})
+        e0, e1 = cbox[0] - cbox[3], cbox[0] + cbox[3]
+        uu0, uu1 = cbox[1] - cbox[7], cbox[1] + cbox[7]
+        n0, n1 = -cbox[2] - cbox[11], -cbox[2] + cbox[11]
+        u_box = (e0, n0, e1, n1, uu0, uu1) if u_box is None else (
+            min(u_box[0], e0), min(u_box[1], n0), max(u_box[2], e1),
+            max(u_box[3], n1), min(u_box[4], uu0), max(u_box[5], uu1))
+    if u_box is None:
+        log("[-] 3D Tiles: 没有可挤出的建筑")
+        return None, {"error": "no buildings"}
+    span = max(max_ce - min_ce, max_cn - min_cn)
     tileset = {
-        "asset": {"version": "1.0", "generator": "gis-data-download/1.0"},
-        "geometricError": 1000,
+        "asset": {"version": "1.0", "generator": "gis-data-download/1.2"},
+        "geometricError": span * 4 + 100,
         "root": {
             "transform": enu_to_ecef_matrix(lon0, lat0, 0.0),
-            "boundingVolume": {"box": box},
-            "geometricError": 0,
+            "boundingVolume": {"box": _enu_box(u_box)},
             "refine": "REPLACE",
-            "content": {"uri": "scene.b3dm"},
+            "geometricError": span / 2 + 50,
+            "children": children,
         },
     }
     ts_path = os.path.join(out_dir, "tileset.json")
     with open(ts_path, "w", encoding="utf-8") as fh:
         json.dump(tileset, fh, indent=2)
-
-    size_mb = os.path.getsize(b3dm_path) / 1048576
-    log(f"[✓] 3D Tiles: {ts_path}  (b3dm {size_mb:.1f} MB, {len(feats) - skipped} 栋, 跳过 {skipped})")
-    info = {"buildings": len(feats) - skipped, "skipped": skipped,
-            "b3dm_mb": round(size_mb, 2), "format": "3D Tiles 1.0 / b3dm, ENU 局部坐标系",
+    log(f"[✓] 3D Tiles: {ts_path}  (分块 {len(children)} 块 / 网格 {grid}×{grid}, "
+        f"b3dm 合计 {total_mb:.1f} MB, {nb - total_skipped} 栋, 跳过 {total_skipped})")
+    info = {"buildings": nb - total_skipped, "skipped": total_skipped,
+            "b3dm_mb": round(total_mb, 2), "tiles": len(children),
+            "format": "3D Tiles 1.0 / b3dm 分块 (网格入口)",
             "dem_base": bool(dem_info)}
     return ts_path, info
 
@@ -964,6 +1118,15 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   #panel #layers label{margin-top:2px;}
   #panel .meta{color:#9ab;font-size:12px;margin-top:8px;border-top:1px solid #345;padding-top:8px;}
   #status{color:#fa0;}
+  #panel input[type=text]{width:100%;box-sizing:border-box;background:#22323f;color:#eee;
+        border:1px solid #345;border-radius:6px;padding:3px 8px;font-size:12px;outline:none;}
+  #panel input[type=text]:focus{border-color:#5c96ff;}
+  #panel #qlistBox{max-height:132px;overflow:auto;font-size:12px;display:none;}
+  #panel #qlistBox div{padding:2px 6px;cursor:pointer;border-radius:4px;}
+  #panel #qlistBox div:hover{background:#2c4a66;}
+  #panel .sunrow{margin-top:6px;font-size:12px;color:#9ab;display:flex;align-items:center;gap:6px;}
+  #panel .sunrow input[type=range]{flex:1;accent-color:#f7b731;}
+  #panel #summary{margin-top:4px;}
   #pick{position:absolute;left:12px;bottom:12px;z-index:9;background:rgba(255,255,255,.94);
         color:#1b2733;padding:12px 14px;border-radius:10px;font:13px/1.6 system-ui,sans-serif;
         width:212px;box-shadow:0 2px 14px rgba(0,0,0,.35);}
@@ -972,6 +1135,10 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   #pick .row span{color:#5a6a78;white-space:nowrap;}
   #pick .row b{font-weight:600;text-align:right;word-break:break-all;}
   #pick .tip{color:#8a97a3;font-size:11px;margin-top:6px;}
+  #pick #pkMore{color:#2c5fa8;cursor:pointer;font-size:12px;margin-top:6px;user-select:none;}
+  #pick #pkAll{display:none;font-size:11.5px;color:#41525f;margin-top:4px;max-height:180px;overflow:auto;
+        border-top:1px dashed #ccd4da;padding-top:4px;}
+  #pick #pkAll div{display:flex;justify-content:space-between;gap:6px;padding:1px 0;}
 </style>
 </head>
 <body>
@@ -979,22 +1146,28 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
 <div id="pick" hidden>
   <h4 id="pkName"></h4>
   <div id="pkRows"></div>
+  <div id="pkMore">全部属性 ▾</div>
+  <div id="pkAll"></div>
   <div class="tip">单击选择 / 空白处取消 / Esc 取消</div>
 </div>
 <div id="panel">
   <h3>__NAME__</h3>
-  <label><input type="checkbox" id="ckTiles" checked> 建筑·纹理白模（3D Tiles 离线包）</label>
+  <input type="text" id="q" placeholder="搜索建筑名称 (Enter 选中并飞过去)…" autocomplete="off">
+  <div id="qlistBox"></div>
+  <label style="margin-top:6px"><input type="checkbox" id="ckTiles" checked> 建筑·纹理白模（3D Tiles 离线包）</label>
   <label><input type="checkbox" id="ckGeo"> 白模·按高度配色（GeoJSON）</label>
   <label><input type="checkbox" id="ckAbs"> 绝对高程模式（接真实地形时勾选；默认贴地预览）</label>
   <div class="presets">
     <button data-p="tex" title="只看纹理 3D Tiles">纹理模式</button><button data-p="heat" title="只看按高度配色的 GeoJSON 白模">高度分析</button><button data-p="all" title="两层叠加">全部显示</button>
   </div>
+  <div class="sunrow">☀ <input type="range" id="sun" min="5" max="20" step="0.25"><span id="sunV" style="min-width:52px"></span></div>
   <div id="layers"></div>
   <div class="meta">
     中心: __LON__, __LAT__<br>
     影像: ESRI World Imagery 在线瓦片<br>
     建筑: <span id="cnt">…</span> 栋（OSM, 高度 POLICY 估算）<br>
     高程底座: Copernicus GLO-30<br>
+    <div id="summary"></div>
     <span id="status">加载中…</span>
   </div>
 </div>
@@ -1044,42 +1217,77 @@ function applyMode(absolute){
   }
 }
 
-// 配套图层样式（道路按等级分色分宽；水系线/面；绿地半透明）
-const ROAD_STYLE = {
-  motorway:  [5.0, "#f7b731"], trunk: [4.5, "#f7b731"],
-  primary:   [4.0, "#ffffff"], secondary: [3.5, "#eef3f6"],
-  tertiary:  [2.5, "#e8eef2"], residential: [1.8, "#cfd8dc"],
-  unclassified: [1.8, "#cfd8dc"], service: [1.2, "#b8c2c8"],
-  living_street: [1.5, "#c8d2d8"], pedestrian: [1.2, "#d8dee2"]
+// 配套图层样式：线状图层用 corridor 真实米宽（道路按等级分色分宽；河流按级别米宽），面状用 GeoJSON
+const ROAD_STYLE = {  // class → [米宽, 颜色, 透明度]
+  motorway:  [26, "#f7b731", 0.6], trunk: [22, "#f7b731", 0.6],
+  primary:   [17, "#ffffff", 0.75], secondary: [13, "#eef3f6", 0.75],
+  tertiary:  [9, "#e8eef2", 0.8], residential: [6, "#cfd8dc", 0.8],
+  unclassified: [5.5, "#cfd8dc", 0.8], service: [3.5, "#b8c2c8", 0.8],
+  living_street: [4.5, "#c8d2d8", 0.8], pedestrian: [3.5, "#d8dee2", 0.8]
 };
-function styleRoad(ent){
-  const cls = ent.properties.class ? ent.properties.class.getValue() : "default";
-  const st = ROAD_STYLE[cls] || [2.5, "#cfd8dc"];
-  ent.polyline.width = st[0];
-  ent.polyline.material = Cesium.Color.fromCssColorString(st[1]).withAlpha(0.95);
+const WATER_W = { river: 22, canal: 16, stream: 5, ditch: 2.5 };  // 河流等级 → 米宽
+function addCorridor(ds, coords, widthM, cssColor, alpha) {
+  if (!coords || coords.length < 2) return;
+  const pos = coords.map(c => Cesium.Cartesian3.fromDegrees(c[0], c[1]));
+  ds.entities.add({ corridor: {
+    positions: pos, width: widthM, cornerType: Cesium.CornerType.ROUNDED,
+    heightReference: Cesium.HeightReference.CLAMP_TO_GROUND,
+    material: Cesium.Color.fromCssColorString(cssColor).withAlpha(alpha) } });
 }
-function styleRail(ent){
-  ent.polyline.width = 2.5;
-  ent.polyline.material = Cesium.Color.fromCssColorString("#9aa4b0").withAlpha(0.9);
+async function loadCorridors(file, perFeature) {
+  const gj = await (await fetch(file)).json();
+  const ds = new Cesium.CustomDataSource(file);
+  for (const f of gj.features) perFeature(ds, f);
+  return ds;
 }
-function styleWater(ent){
-  if (ent.polygon) {
-    ent.polygon.height = 0.08;
-    ent.polygon.material = Cesium.Color.fromCssColorString("#3d9bff").withAlpha(0.85);
-    ent.polygon.outline = false;
-  } else if (ent.polyline) {
-    const cls = ent.properties.class ? ent.properties.class.getValue() : "stream";
-    const w = { river: 5, canal: 4, stream: 2.5, ditch: 1.5 }[cls] || 2.5;
-    ent.polyline.width = w;
-    ent.polyline.material = Cesium.Color.fromCssColorString("#3d9bff").withAlpha(0.85);
+function styleRoad(ds, f) {
+  const cls = f.properties.class || "default";
+  const st = ROAD_STYLE[cls] || [5.5, "#cfd8dc", 0.8];
+  addCorridor(ds, f.geometry.coordinates, st[0], st[1], st[2]);
+}
+function styleRail(ds, f) {
+  addCorridor(ds, f.geometry.coordinates, 4, "#9aa4b0", 0.85);
+}
+function styleWaterLine(ds, f) {
+  const cls = f.properties.class || "stream";
+  addCorridor(ds, f.geometry.coordinates, WATER_W[cls] || 8, "#3d9bff", 0.8);
+}
+async function loadWater(file) {
+  const gj = await (await fetch(file)).json();
+  const ds = new Cesium.CustomDataSource(file);
+  for (const f of gj.features) {
+    if (f.geometry.type === "LineString" || f.geometry.type === "MultiLineString") {
+      const lines = f.geometry.type === "LineString" ? [f.geometry.coordinates] : f.geometry.coordinates;
+      for (const line of lines) styleWaterLine(ds, { geometry: { coordinates: line }, properties: f.properties });
+    } else {
+      const polys = f.geometry.type === "Polygon" ? [f.geometry.coordinates] : f.geometry.coordinates;
+      for (const poly of polys) {
+        const outer = poly[0];   // 外环 (OSM 水面很少带洞, 忽略内环)
+        if (!outer || outer.length < 3) continue;
+        ds.entities.add({ polygon: {
+          hierarchy: Cesium.Cartesian3.fromDegreesArray(outer.flat()),
+          height: 0.08,
+          material: Cesium.Color.fromCssColorString("#3d9bff").withAlpha(0.85) } });
+      }
+    }
   }
+  return ds;
 }
-function styleGreen(ent){
-  if (ent.polygon) {
-    ent.polygon.height = 0.06;
-    ent.polygon.material = Cesium.Color.fromCssColorString("#69a854").withAlpha(0.45);
-    ent.polygon.outline = false;
+async function loadGreen(file) {
+  const gj = await (await fetch(file)).json();
+  const ds = new Cesium.CustomDataSource(file);
+  for (const f of gj.features) {
+    const polys = f.geometry.type === "Polygon" ? [f.geometry.coordinates] : f.geometry.coordinates;
+    for (const poly of polys) {
+      const outer = poly[0];
+      if (!outer || outer.length < 3) continue;
+      ds.entities.add({ polygon: {
+        hierarchy: Cesium.Cartesian3.fromDegreesArray(outer.flat()),
+        height: 0.06,
+        material: Cesium.Color.fromCssColorString("#69a854").withAlpha(0.45) } });
+    }
   }
+  return ds;
 }
 
 (async () => {
@@ -1105,18 +1313,17 @@ function styleGreen(ent){
       viewer.scene.primitives.add(tiles);
     } catch(e) { st.textContent = "3D Tiles 加载失败: " + e; }
 
-    // OSM 配套图层（存在才加载，动态生成开关 + 要素数）
+    // OSM 配套图层（存在才加载，动态生成开关 + 要素数；线状 = corridor 真实米宽）
     const EXTRAS = [
-      { file: "roads.geojson",    label: "道路路网", style: styleRoad },
-      { file: "railways.geojson", label: "铁路轨道", style: styleRail },
-      { file: "water.geojson",    label: "水系",     style: styleWater },
-      { file: "green.geojson",    label: "绿地",     style: styleGreen },
+      { file: "roads.geojson",    label: "道路路网", load: () => loadCorridors("roads.geojson", styleRoad) },
+      { file: "railways.geojson", label: "铁路轨道", load: () => loadCorridors("railways.geojson", styleRail) },
+      { file: "water.geojson",    label: "水系",     load: () => loadWater("water.geojson") },
+      { file: "green.geojson",    label: "绿地",     load: () => loadGreen("green.geojson") },
     ];
     const layerSrc = {};
     for (const L of EXTRAS) {
       try {
-        const ds = await Cesium.GeoJsonDataSource.load(L.file, { clampToGround: true });
-        for (const ent of ds.entities.values) L.style(ent);
+        const ds = await L.load();
         viewer.dataSources.add(ds);
         layerSrc[L.file] = ds;
         const cnt = EXTRAS_META[L.file] != null ? ` (${EXTRAS_META[L.file]})` : "";
@@ -1129,6 +1336,20 @@ function styleGreen(ent){
       const f = e.target.dataset.f;
       if (f && layerSrc[f]) layerSrc[f].show = e.target.checked;
     };
+
+    // 日照时间滑块 (拖动改太阳方位, 建筑光影实时变化; 默认上午 10:30 利演示)
+    viewer.scene.globe.enableLighting = true;
+    const sunSlider = document.getElementById("sun");
+    sunSlider.value = 10.5;
+    function setSun(h) {
+      const d = new Date();
+      viewer.clock.currentTime = Cesium.JulianDate.fromDate(
+        new Date(d.getFullYear(), d.getMonth(), d.getDate(), Math.floor(h), Math.round((h % 1) * 60)));
+      viewer.clock.shouldAnimate = false;
+      document.getElementById("sunV").textContent = String(Math.floor(h)).padStart(2, "0") + ":" + String(Math.round((h % 1) * 60)).padStart(2, "0");
+    }
+    sunSlider.oninput = e => setSun(parseFloat(e.target.value));
+    setSun(parseFloat(sunSlider.value));
 
     // 预设模式: 纹理 / 高度分析 / 全部
     document.querySelectorAll("#panel .presets button").forEach(btn => {
@@ -1167,8 +1388,91 @@ function styleGreen(ent){
       if (g("area_m2_est")) add("占地", `${g("area_m2_est")} m²`);
       add("OSM ID", g("osm_id"));
       document.getElementById("pkRows").innerHTML = rows.join("");
+      const all = ["name", "building", "height_m", "base_m", "top_m", "levels",
+                   "amenity", "addr", "area_m2_est", "height_source", "osm_id"];
+      document.getElementById("pkAll").innerHTML =
+        all.map(k => `<div><span>${k}</span><b>${g(k) || "—"}</b></div>`).join("");
+      document.getElementById("pkMore").textContent = "全部属性 ▾";
       pickEl.hidden = false;
     }
+    document.getElementById("pkMore").onclick = () => {
+      const el = document.getElementById("pkAll");
+      const show = el.style.display !== "block";
+      el.style.display = show ? "block" : "none";
+      document.getElementById("pkMore").textContent = show ? "收起 ▴" : "全部属性 ▾";
+    };
+
+    // 建筑名称搜索 → 选中并飞过去 (从 GeoJSON 取质心)
+    let namedBldgs = [];
+    try {
+      const gj = await (await fetch("buildings.geojson")).json();
+      namedBldgs = gj.features.filter(f => f.properties.name).map(f => {
+        const pts = f.geometry.coordinates[0];
+        let sx = 0, sy = 0;
+        for (const q of pts) { sx += q[0]; sy += q[1]; }
+        return { name: f.properties.name, height: f.properties.height_m,
+                 top: f.properties.top_m, base: f.properties.base_m,
+                 lon: sx / pts.length, lat: sy / pts.length, props: f.properties };
+      });
+      const box = document.getElementById("qlistBox");
+      const q = document.getElementById("q");
+      q.oninput = () => {
+        const kw = q.value.trim().toLowerCase();
+        box.style.display = kw ? "block" : "none";
+        box.innerHTML = namedBldgs.filter(b => b.name.toLowerCase().includes(kw))
+          .slice(0, 8).map((b, i) => `<div data-i="${namedBldgs.indexOf(b)}">${b.name} <span style="color:#7a8a98">${b.height}m</span></div>`).join("");
+      };
+      box.onclick = async e => {
+        const d = e.target.closest("div[data-i]");
+        if (!d) return;
+        box.style.display = "none";
+        q.value = "";
+        const b = namedBldgs[+d.dataset.i];
+        await viewer.camera.flyTo({
+          destination: Cesium.Cartesian3.fromDegrees(b.lon, b.lat - 0.0004, (b.top - (b.base || 0)) * 4 + 160),
+          orientation: { heading: 0, pitch: Cesium.Math.toRadians(-40), roll: 0 },
+          duration: 1.8 });
+        // 飞完在其顶部中心投影拾取, 复用选中高亮+信息卡
+        const carto = Cesium.Cartesian3.fromDegrees(b.lon, b.lat, (b.top || 10) + 1);
+        await new Promise(r2 => setTimeout(r2, 400));
+        const win = Cesium.SceneTransforms.worldToWindowCoordinates(viewer.scene, carto);
+        if (win) {
+          const pk = viewer.scene.pick(win);
+          if (pk instanceof Cesium.Cesium3DTileFeature) {
+            if (selectedF) setClr(selectedF, Cesium.Color.WHITE);
+            selectedF = pk;
+            setClr(selectedF, SELECT_C);
+            showInfo(pk);
+            return;
+          }
+        }
+        // 拾取失败也直接显示属性卡
+        const proxy = { getProperty: k => b.props[k] };
+        if (selectedF) setClr(selectedF, Cesium.Color.WHITE);
+        selectedF = null;
+        showInfo(proxy);
+      };
+    } catch(e) { /* buildings.geojson 缺失则无搜索 */ }
+
+    // 数据完整度概况 (读 download_report.json)
+    try {
+      const rep = await (await fetch("download_report.json")).json();
+      const o = rep.outputs || {};
+      const parts = [];
+      const img = o.imagery || {};
+      if (img.zoom) parts.push(`影像 z${img.zoom}${img.failed_tiles ? ` (失败 ${img.failed_tiles})` : ""}`);
+      const dem = o.dem || {};
+      if (dem.elev_min != null) parts.push(`DEM ${Math.round(dem.elev_min)}~${Math.round(dem.elev_max)}m`);
+      const b = o.buildings || {};
+      if (b.count) parts.push(`建筑 ${b.count}${b.height_from_osm_tag != null ? ` (OSM标高 ${b.height_from_osm_tag})` : ""}`);
+      const ly = b.layers || {};
+      const lname = { roads: "路网", railways: "铁路", water: "水系", green: "绿地" };
+      const lyStr = Object.entries(ly).map(([k, v]) => `${lname[k] || k} ${v}`).join(" · ");
+      if (lyStr) parts.push(lyStr);
+      document.getElementById("summary").innerHTML = parts.join("<br>") ||
+        `<span style="color:#6a7a88">report 缺少数据概况</span>`;
+    } catch(e) { /* report 缺失忽略 */ }
+
     const handler = new Cesium.ScreenSpaceEventHandler(viewer.scene.canvas);
     handler.setInputAction(m => {
       const pk = viewer.scene.pick(m.position);
@@ -1264,6 +1568,10 @@ def main():
     ap.add_argument("--skip-preview", action="store_true")
     ap.add_argument("--skip-extras", action="store_true",
                     help="不提取道路/铁路/水系/绿地等 OSM 配套图层")
+    ap.add_argument("--tile-threshold", type=int, default=1500,
+                    help="建筑数超过该值时 3D Tiles 自动分块 (默认 1500)")
+    ap.add_argument("--resume", action="store_true",
+                    help="断点续传: 复用输出目录已有的影像/DEM/建筑/配套图层, 只重做 3D Tiles/预览/报告")
     args = ap.parse_args()
 
     DEFAULT_HEIGHT = args.default_height
@@ -1325,6 +1633,30 @@ def main():
               "建筑覆盖依赖 OSM 完整度 (中国县城可能稀疏)。非测绘级成果, 仅供场景搭建参考。",
               "outputs": {}}
 
+    # 断点续传 (--resume): 已有产物直接复用, 跳过对应网络下载; 3D Tiles/预览/报告重做
+    resumed = []
+    old_report = {}
+    if args.resume:
+        rp_old = os.path.join(out_dir, "download_report.json")
+        if os.path.isfile(rp_old):
+            try:
+                with open(rp_old, encoding="utf-8") as fh:
+                    old_report = json.load(fh)
+            except Exception:
+                old_report = {}
+        if not args.skip_imagery:
+            hit = sorted(glob.glob(os.path.join(out_dir, "imagery_z*_*.tif")))
+            if hit:
+                args.skip_imagery = True
+                resumed.append(os.path.basename(hit[0]))
+        if not args.skip_dem and os.path.isfile(os.path.join(out_dir, "dem_glo30_30m.tif")):
+            args.skip_dem = True
+            resumed.append("dem_glo30_30m.tif")
+        if resumed:
+            log("[*] 续传: 复用已有产物 → " + ", ".join(resumed))
+    if resumed:
+        report["resumed"] = resumed
+
     # ESRI z19+ 在很多县城/乡镇区域是占位灰瓦片 ("Map data not yet available"),
     # 直接下载会得到灰色马赛克。先探测, 占位则自动降级。
     if args.source == "esri" and not args.skip_imagery and args.zoom >= 19:
@@ -1346,56 +1678,93 @@ def main():
                                    workers=args.workers)
         report["outputs"]["imagery"] = info
     else:
-        p = None
+        p = os.path.join(out_dir, f"imagery_z{args.zoom}_{args.source}.tif")
+        if args.resume and os.path.isfile(p):
+            report["outputs"]["imagery"] = dict(
+                (old_report.get("outputs") or {}).get("imagery") or {"file": os.path.basename(p)},
+                resumed=True)
 
     # 2. 高程
     if not args.skip_dem:
         dem_path, dem_info = download_dem(w, s, e, n, os.path.join(out_dir, "dem_glo30_30m.tif"))
         report["outputs"]["dem"] = dem_info
     else:
-        dem_path, dem_info = None, {}
+        dem_path = os.path.join(out_dir, "dem_glo30_30m.tif")
+        dem_info = dict(
+            (old_report.get("outputs") or {}).get("dem") or {},
+            resumed=True) if args.resume and os.path.isfile(dem_path) else {}
 
     # 3. 建筑 + OSM 配套图层 (道路/铁路/水系/绿地)
     dem_sample = make_dem_sampler(dem_path)
     buildings_info = {}
     extras_counts = {}
+    feats = None
+    resumed_bldg = (args.resume and not args.skip_buildings
+                    and os.path.isfile(os.path.join(out_dir, "buildings.geojson")))
     if not args.skip_buildings:
-        elements, used_ep = fetch_osm(w, s, e, n)
-        if elements is None:
-            log("[-] OSM: 所有 Overpass 端点失败 (国内可尝试加 astar 代理)")
-            buildings_info = {"error": "overpass unreachable"}
+        if resumed_bldg:
+            with open(os.path.join(out_dir, "buildings.geojson"), encoding="utf-8") as fh:
+                feats = json.load(fh)["features"]
+            n_osm = sum(1 for f in feats if "osm" in (f["properties"].get("height_source") or ""))
+            buildings_info = {"resumed": True, "count": len(feats),
+                              "height_from_osm_tag": n_osm,
+                              "height_policy_estimate": len(feats) - n_osm}
+            log(f"[*] 续传: 复用已有 buildings.geojson ({len(feats)} 栋), 跳过 Overpass")
         else:
-            feats, stats = osm_to_features(elements, dem_sample)
-            geo_path = os.path.join(out_dir, "buildings.geojson")
-            write_layer_geojson(feats, geo_path, (w, s, e, n), "建筑", {
-                "height_policy": f"OSM height 标签 > building:levels×{FLOOR_HEIGHT} > 默认 {DEFAULT_HEIGHT}m (POLICY 估算)",
-                "unit": "栋"})
-            buildings_info = {"endpoint_used": used_ep, "count": len(feats),
-                              "height_from_osm_tag": stats["from"],
-                              "height_policy_estimate": stats["no_tag"],
-                              "skipped_small": stats["skipped_small"],
-                              "skipped_invalid": stats["skipped_open"]}
-            log(f"[*]   高度来源: OSM 标签 {stats['from']} 栋, POLICY 估算 {stats['no_tag']} 栋")
+            elements, used_ep = fetch_osm(w, s, e, n)
+            if elements is None:
+                log("[-] OSM: 所有 Overpass 端点失败 (国内可尝试加 astar 代理)")
+                buildings_info = {"error": "overpass unreachable"}
+            else:
+                feats, stats = osm_to_features(elements, dem_sample)
+                geo_path = os.path.join(out_dir, "buildings.geojson")
+                write_layer_geojson(feats, geo_path, (w, s, e, n), "建筑", {
+                    "height_policy": f"OSM height 标签 > building:levels×{FLOOR_HEIGHT} > 默认 {DEFAULT_HEIGHT}m (POLICY 估算)",
+                    "unit": "栋"})
+                buildings_info = {"endpoint_used": used_ep, "count": len(feats),
+                                  "height_from_osm_tag": stats["from"],
+                                  "height_policy_estimate": stats["no_tag"],
+                                  "skipped_small": stats["skipped_small"],
+                                  "skipped_invalid": stats["skipped_open"]}
+                log(f"[*]   高度来源: OSM 标签 {stats['from']} 栋, POLICY 估算 {stats['no_tag']} 栋")
 
-            if not args.skip_extras:
-                layers = osm_extras_to_features(elements)
-                layer_counts = {}
-                layer_labels = {"roads": "道路路网", "railways": "铁路轨道",
-                                "water": "水系", "green": "绿地"}
-                for lname, fts in layers.items():
-                    layer_counts[lname] = len(fts)
-                    if fts:
-                        write_layer_geojson(fts, os.path.join(out_dir, f"{lname}.geojson"),
-                                            (w, s, e, n), layer_labels[lname], {"unit": "要素"})
-                buildings_info["layers"] = layer_counts
-                extras_counts = {f"{k}.geojson": v for k, v in layer_counts.items()}
-                log(f"[*]   配套图层: " + ", ".join(f"{k} {v}" for k, v in layer_counts.items()))
+                if not args.skip_extras:
+                    layers = osm_extras_to_features(elements)
+                    layer_counts = {}
+                    layer_labels = {"roads": "道路路网", "railways": "铁路轨道",
+                                    "water": "水系", "green": "绿地"}
+                    for lname, fts in layers.items():
+                        layer_counts[lname] = len(fts)
+                        if fts:
+                            write_layer_geojson(fts, os.path.join(out_dir, f"{lname}.geojson"),
+                                                (w, s, e, n), layer_labels[lname], {"unit": "要素"})
+                    buildings_info["layers"] = layer_counts
+                    extras_counts = {f"{k}.geojson": v for k, v in layer_counts.items()}
+                    log(f"[*]   配套图层: " + ", ".join(f"{k} {v}" for k, v in layer_counts.items()))
 
-            # 4. 3D Tiles
-            if not args.skip_3dtiles and feats:
-                _, tiles_info = write_3dtiles(feats, lon0, lat0,
-                                              os.path.join(out_dir, "buildings_3dtiles"), dem_info)
-                buildings_info["3d_tiles"] = tiles_info
+        if resumed_bldg and not args.skip_extras:
+            for lname in ("roads", "railways", "water", "green"):
+                fp = os.path.join(out_dir, f"{lname}.geojson")
+                cnt = 0
+                if os.path.isfile(fp):
+                    try:
+                        with open(fp, encoding="utf-8") as fh:
+                            cnt = len(json.load(fh)["features"])
+                    except Exception:
+                        cnt = 0
+                extras_counts[f"{lname}.geojson"] = cnt
+            buildings_info["layers"] = {"roads": extras_counts["roads.geojson"],
+                                        "railways": extras_counts["railways.geojson"],
+                                        "water": extras_counts["water.geojson"],
+                                        "green": extras_counts["green.geojson"]}
+            log("[*] 续传: 配套图层计数取自已有文件")
+
+        # 4. 3D Tiles (新建与续传都要重做: 建筑或模板可能已更新)
+        if not args.skip_3dtiles and feats:
+            _, tiles_info = write_3dtiles(feats, lon0, lat0,
+                                          os.path.join(out_dir, "buildings_3dtiles"), dem_info,
+                                          tile_threshold=args.tile_threshold)
+            buildings_info["3d_tiles"] = tiles_info
 
     # 5. 预览页
     if not args.skip_preview:
