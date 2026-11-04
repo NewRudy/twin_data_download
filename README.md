@@ -6,7 +6,7 @@
 |---|---|---|
 | 高清影像 | ESRI World Imagery (Maxar) / Google 卫星 | GeoTIFF (EPSG:3857)，z17≈1.2m、z18≈0.6m |
 | 高程 DEM | Copernicus GLO-30 | GeoTIFF (EPSG:4326)，标称 30m |
-| 建筑物 | OpenStreetMap（Overpass API） | GeoJSON（含高度估算） |
+| 建筑物 | OpenStreetMap（Overpass API） | GeoJSON（含高度估算；`--heights cnbh` 可注入 CNBH-10m 栅格高度） |
 | 道路/铁路/水系/绿地 | OpenStreetMap（同一次 Overpass 查询） | 各自独立 GeoJSON，"OSM 提供啥就提取啥" |
 | 3D 白模 | 由建筑轮廓挤出（封闭屋顶 + 女儿墙 + 屋顶设备盒 + 程序化立面纹理：窗格/亮灯窗/按建筑类型调色；逐栋 batchId；>1500 栋自动分块 LOD） | 3D Tiles 1.0（b3dm + tileset.json + batch table） |
 | 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh；悬停/单击高亮拾取+信息卡、按名称搜索飞行、日照时间滑块、道路/铁路/水系/绿地独立开关（真实米宽走廊）、42° 斜视角 |
@@ -39,6 +39,7 @@ bash setup_env.sh                      # 创建 ~/.venv_imagery 并装依赖（�
 --skip-3dtiles --skip-preview
 --resume              # 断点续传: 复用已有产物, 跳过网络下载, 只重做 3D Tiles/预览/报告
 --tile-threshold 1500 # 建筑数超过该值 3D Tiles 自动网格分块 (~350 栋/块)
+--heights cnbh        # 无 OSM 标签的建筑注入 CNBH-10m 栅格高度 (Zenodo, 需外网)
 --name 场景名 --out 输出目录
 ```
 

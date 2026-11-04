@@ -59,6 +59,10 @@ http_proxy=http://127.0.0.1:58309 https_proxy=http://127.0.0.1:58309 all_proxy= 
 # 只重做 3D Tiles / 预览页 / 报告 (改完模板或参数后重出交付物用这个, 秒级)
 ... --resume
 
+# CNBH-10m 建筑高度注入 (无 OSM 标签的栋用 10m 栅格估算值, OSM 标签优先保留;
+# 首次按度格下载瓦片 10-50MB 缓存 ~/.cache/cnbh10m, 需外网/代理)
+... --heights cnbh
+
 # 不要道路/水系/绿地配套图层
 ... --skip-extras
 ```
@@ -128,8 +132,12 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 
 ## 边界与证据（必读）
 
-- **建筑高度是 POLICY 估算**：OSM `height` 标签 > `building:levels`×3m > 默认 6m，
-  每栋的估算依据记录在 `properties.height_source`。不能当测绘成果用。
+- **建筑高度是估算**：`--heights cnbh` 时无 OSM 标签的栋注入 CNBH-10m 栅格估算
+  (Wu et al. 2023, Zenodo 7923866, 2020 年度, 10m MODELED——比默认 6m 合理得多,
+  但仍是模型估算非测绘)；其余栋为 POLICY (OSM 标签 > 层数×3m > 默认 6m)。
+  每栋依据在 `properties.height_source` (osm:height / cnbh10m / policy:*),
+  汇总在 report `buildings.height_cnbh`。**CNBH 只补高度不补轮廓**——
+  OSM 覆盖稀疏地区的建筑栋数问题依然存在。不能当测绘成果用。
 - **OSM 建筑在中国基本不可用**（2026-11-03 实测）：永新县城 3km 框仅 9 栋、
   贵阳花果园 1.7km 框仅 10 栋（实际数万栋）。三大全球免费源中
   Microsoft Global ML Building Footprints 和 Google Open Buildings 均不覆盖中国。
@@ -159,6 +167,13 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
   浏览器验证：4/4 块加载、1014 栋全部渲染、位置与影像对齐✓（单 tile 路径回归一致✓；
   教训：测试时中心坐标手打错一位（31.1807→31.8071）导致包围盒漂移 68km、建筑被视锥剔除，
   症状是"加载了但全黑"，先核对坐标再怀疑代码）。
+  **CNBH-10m 高度注入 `--heights cnbh`**：Zenodo 7923866 瓦片按度格缓存
+  (~/.cache/cnbh10m)；**瓦片是 UTM 投影 (EPSG:32651) 不是 4326**——采样前须把
+  质心 rasterio.warp.transform 到瓦片 CRS（小涞港窗按 4326 读窗得零尺寸数组）。
+  小涞港 937/1014 栋注入（中位 20.2m / 最大 37.8m，14 栋 OSM 标签保留、63 栋无像素
+  保留 POLICY），高度分析预设从"清一色 6m 白板"变成真实城市高度梯度（商务区红≥24m、
+  居住橙金、仓储绿）✓ 截图 acceptance/2026-11-05-cnbh-heights.png；面板/报告显示
+  注入数✓。
   **配套图层 bug 修复**：水系/绿地面要素的 fromDegreesArray 被传入嵌套数组
   （RangeError: Invalid array length），被 per-layer try/catch 静默吞掉导致开关消失；
   改为正确遍历 Polygon 外环后 4 图层齐全✓（教训：图层加载失败不该静默，

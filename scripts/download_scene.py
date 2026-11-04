@@ -1095,6 +1095,118 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info, tile_threshold=1500):
     return ts_path, info
 
 
+# ---------------------------------------------------------- CNBH-10m 高度注入
+
+CNBH_RECORD = "https://zenodo.org/api/records/7923866"  # Wu et al. 2023, RSE
+
+
+def cnbh_tile_index(cache):
+    """CNBH-10m (Zenodo 7923866) tif 文件清单 → {文件名: 下载URL}, 本地缓存。"""
+    idx_path = os.path.join(cache, "record_7923866.json")
+    if os.path.isfile(idx_path):
+        with open(idx_path, encoding="utf-8") as fh:
+            return json.load(fh)
+    import requests
+    r = requests.get(CNBH_RECORD, timeout=60)
+    r.raise_for_status()
+    idx = {f["key"]: f["links"]["self"]
+           for f in r.json().get("files", []) if f["key"].endswith(".tif")}
+    if not idx:
+        raise RuntimeError("Zenodo 清单里没有 tif 文件")
+    with open(idx_path, "w", encoding="utf-8") as fh:
+        json.dump(idx, fh)
+    return idx
+
+
+def _download_cnbh_tile(url, path):
+    import requests
+    tmp = path + ".part"
+    with requests.get(url, stream=True, timeout=600, allow_redirects=True) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as fh:
+            for chunk in r.iter_content(1 << 20):
+                fh.write(chunk)
+    os.replace(tmp, path)
+
+
+def inject_cnbh_heights(feats, bbox):
+    """CNBH-10m 建筑高度注入 (10m 栅格逐栋质心采样, MODELED 估算非测绘)。
+
+    有 OSM height 标签的栋保留标签 (更可信); 其余用 10m 像素值 (0.1~400m)
+    覆盖 height_m/top_m 并记 height_source='cnbh10m'。瓦片缓存在
+    ~/.cache/cnbh10m (10-50MB/度格)。返回注入栋数; 下载/清单失败返回 0 不抛,
+    建筑保留 POLICY 估算。
+    """
+    w, s, e, n = bbox
+    cache = os.path.expanduser("~/.cache/cnbh10m")
+    os.makedirs(cache, exist_ok=True)
+    try:
+        idx = cnbh_tile_index(cache)
+        import rasterio
+    except Exception as exc:
+        log(f"[!] CNBH-10m 不可用 ({exc}), 建筑保留 POLICY 估算")
+        return 0
+    cands = {f"CNBH10m_X{x}Y{y}.tif" if f"CNBH10m_X{x}Y{y}.tif" in idx
+             else f"CNBH10m_X{x:03d}Y{y:02d}.tif"
+             for x in {int(math.floor(v)) for v in (w, e)}
+             for y in {int(math.floor(v)) for v in (s, n)}}
+    srcs = []
+    for name in sorted(cands):
+        if name not in idx:
+            log(f"[!] CNBH-10m 无瓦片 {name}, 该区域保留 POLICY 估算")
+            continue
+        tpath = os.path.join(cache, name)
+        if not os.path.isfile(tpath):
+            log(f"[*] CNBH-10m: 下载 {name} (约 10-50MB, 缓存 {cache}) ...")
+            try:
+                _download_cnbh_tile(idx[name], tpath)
+            except Exception as exc:
+                log(f"[!] {name} 下载失败 ({exc}), 保留 POLICY 估算")
+                continue
+        srcs.append(rasterio.open(tpath))
+    if not srcs:
+        return 0
+    injected = 0
+    remaining = []
+    for i, f in enumerate(feats):
+        p = f["properties"]
+        if "osm" in (p.get("height_source") or ""):
+            continue                     # OSM height 标签优先, 不覆盖
+        ring = f["geometry"]["coordinates"][0]
+        pts = ring[:-1] if len(ring) > 4 else ring
+        remaining.append((i, sum(v[0] for v in pts) / len(pts),
+                          sum(v[1] for v in pts) / len(pts)))
+    from rasterio.warp import transform as _warp4326
+    for src in srcs:                     # 瓦片多为 UTM 投影, 需把质心转到瓦片 CRS 采样
+        if not remaining:
+            break
+        b = src.bounds
+        xs, ys = _warp4326("EPSG:4326", src.crs,
+                           [c[1] for c in remaining], [c[2] for c in remaining])
+        todo = [k for k, (x, y) in enumerate(zip(xs, ys))
+                if b.left <= x <= b.right and b.bottom <= y <= b.top]
+        if not todo:
+            continue
+        samples = src.sample([(xs[k], ys[k]) for k in todo])
+        done = set()
+        for k, v in zip(todo, samples):
+            v = float(v[0])
+            if src.nodata is not None and v == src.nodata:
+                v = 0.0
+            if 0.1 <= v <= 400:          # 合理建筑高度范围, 过滤 nodata/噪声
+                p = feats[remaining[k][0]]["properties"]
+                p["height_m"] = round(v, 1)
+                p["top_m"] = round(p.get("base_m", 0.0) + v, 1)
+                p["height_source"] = "cnbh10m"
+                injected += 1
+                done.add(k)
+        remaining = [c for k, c in enumerate(remaining) if k not in done]
+    for src in srcs:
+        src.close()
+    log(f"[*] CNBH-10m 高度注入: {injected}/{len(feats)} 栋 (其余保留 POLICY 估算)")
+    return injected
+
+
 # ---------------------------------------------------------------- 5. 预览页
 
 PREVIEW_TPL = r"""<!DOCTYPE html>
@@ -1165,7 +1277,7 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   <div class="meta">
     中心: __LON__, __LAT__<br>
     影像: ESRI World Imagery 在线瓦片<br>
-    建筑: <span id="cnt">…</span> 栋（OSM, 高度 POLICY 估算）<br>
+    建筑: <span id="cnt">…</span> 栋（OSM 轮廓, 高度估算见信息卡）<br>
     高程底座: Copernicus GLO-30<br>
     <div id="summary"></div>
     <span id="status">加载中…</span>
@@ -1464,7 +1576,7 @@ async function loadGreen(file) {
       const dem = o.dem || {};
       if (dem.elev_min != null) parts.push(`DEM ${Math.round(dem.elev_min)}~${Math.round(dem.elev_max)}m`);
       const b = o.buildings || {};
-      if (b.count) parts.push(`建筑 ${b.count}${b.height_from_osm_tag != null ? ` (OSM标高 ${b.height_from_osm_tag})` : ""}`);
+      if (b.count) parts.push(`建筑 ${b.count}${b.height_cnbh != null ? ` (CNBH-10m 注入 ${b.height_cnbh})` : b.height_from_osm_tag != null ? ` (OSM标高 ${b.height_from_osm_tag})` : ""}`);
       const ly = b.layers || {};
       const lname = { roads: "路网", railways: "铁路", water: "水系", green: "绿地" };
       const lyStr = Object.entries(ly).map(([k, v]) => `${lname[k] || k} ${v}`).join(" · ");
@@ -1570,6 +1682,9 @@ def main():
                     help="不提取道路/铁路/水系/绿地等 OSM 配套图层")
     ap.add_argument("--tile-threshold", type=int, default=1500,
                     help="建筑数超过该值时 3D Tiles 自动分块 (默认 1500)")
+    ap.add_argument("--heights", choices=["cnbh"], default=None,
+                    help="建筑高度注入: cnbh = CNBH-10m 栅格估算 (Zenodo 7923866, "
+                         "需外网或代理, 瓦片缓存 ~/.cache/cnbh10m); OSM height 标签优先保留")
     ap.add_argument("--resume", action="store_true",
                     help="断点续传: 复用输出目录已有的影像/DEM/建筑/配套图层, 只重做 3D Tiles/预览/报告")
     args = ap.parse_args()
@@ -1758,6 +1873,17 @@ def main():
                                         "water": extras_counts["water.geojson"],
                                         "green": extras_counts["green.geojson"]}
             log("[*] 续传: 配套图层计数取自已有文件")
+
+        # 3.5 CNBH-10m 高度注入 (新建/续传都生效; OSM 标签优先保留)
+        if args.heights and feats:
+            n_inj = inject_cnbh_heights(feats, (w, s, e, n))
+            if n_inj:
+                buildings_info["height_cnbh"] = n_inj
+                write_layer_geojson(feats, os.path.join(out_dir, "buildings.geojson"),
+                                    (w, s, e, n), "建筑", {
+                    "height_policy": f"CNBH-10m 注入 > OSM height 标签 > "
+                                     f"building:levels×{FLOOR_HEIGHT} > 默认 {DEFAULT_HEIGHT}m (估算)",
+                    "unit": "栋"})
 
         # 4. 3D Tiles (新建与续传都要重做: 建筑或模板可能已更新)
         if not args.skip_3dtiles and feats:
