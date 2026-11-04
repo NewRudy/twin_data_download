@@ -40,6 +40,8 @@ bash setup_env.sh                      # 创建 ~/.venv_imagery 并装依赖（�
 --resume              # 断点续传: 复用已有产物, 跳过网络下载, 只重做 3D Tiles/预览/报告
 --tile-threshold 1500 # 建筑数超过该值 3D Tiles 自动网格分块 (~350 栋/块)
 --heights cnbh        # 无 OSM 标签的建筑注入 CNBH-10m 栅格高度 (Zenodo, 需外网)
+--offline             # 离线预览包: 影像转本地 XYZ 瓦片 + CesiumJS 本地化 + GLO-30
+                      # 本地地形, 输出目录自包含, 断网打开即用 (投标/汇报现场)
 --name 场景名 --out 输出目录
 ```
 
@@ -52,7 +54,8 @@ cd <输出目录> && ./serve.sh
 
 预览页默认**纹理模式**（3D Tiles 立面带窗格纹理）；「高度分析」切换为按高度配色的
 GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数），默认**贴地模式**+42° 斜视角；
-接真实地形渲染时勾选「绝对高程模式」。
+接真实地形渲染时勾选「绝对高程模式」；`--offline` 产物额外带「本地地形」开关
+（GLO-30 heightmap 地形，勾选后建筑随真实地形起伏）。
 
 ## 输出结构
 
@@ -68,6 +71,9 @@ GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数）
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF，Cesium 直接加载
 │   └── scene.b3dm            # ≤1500 栋单 tile；更多时为 tiles/cell_*.b3dm 分块
+├── tiles/                    # --offline: 影像 XYZ 瓦片 z(native-6)-z(native)
+├── cesium/                   # --offline: CesiumJS 1.142 本地副本 (~22MB)
+├── terrain/                  # --offline: GLO-30 heightmap-1.0 地形瓦片 + layer.json
 ├── cesium_preview.html
 ├── serve.sh
 └── download_report.json      # 证据记录
@@ -90,6 +96,8 @@ GeoJSON 白模可用 `extrudedHeight=top_m / height=base_m` 客户端挤出，�
 - **ESRI z19+ 在县城/乡镇多为占位灰瓦片**（"Map data not yet available"），
   本工具会自动探测并降级到有真实影像的层级。
 - 分辨率为按纬度换算的估算值；DEM 30m 适合做场景地形底座，非测绘级。
+- `--offline` 地形把 GLO-30 正高直接当椭球高（忽略大地水准面差距，平原误差约 ±10m 级）；
+  本地化的 ESRI 影像衍生瓦片仅供现场/内部演示预览，**不得再分发**（Esri 服务条款）。
 - 几何验证工具：`python3 scripts/dissect_b3dm.py <scene.b3dm>` 可解剖 b3dm，
   校验屋顶法线朝上且位于楼顶高度（曾据此发现并修复屋顶画在楼底的 bug）。
 

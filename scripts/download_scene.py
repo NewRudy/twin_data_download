@@ -22,6 +22,7 @@ import io
 import json
 import math
 import os
+import shutil
 import struct
 import sys
 import time
@@ -1207,6 +1208,224 @@ def inject_cnbh_heights(feats, bbox):
     return injected
 
 
+# ---------------------------------------------------------- 离线预览包
+
+CESIUM_TGZ = "https://registry.npmmirror.com/cesium/-/cesium-1.142.0.tgz"
+_MERC_R = 6378137.0
+
+
+def _merc_y2lat(y):
+    return math.degrees(2 * math.atan(math.exp(y / _MERC_R)) - math.pi / 2)
+
+
+def _lat2tile_y(latd, z):
+    lr = math.radians(latd)
+    return (1 - math.log(math.tan(lr) + 1 / math.cos(lr)) / math.pi) / 2 * (2 ** z)
+
+
+def _tile_y2merc(yt, z):
+    n = 2 ** z
+    latd = math.atan(math.sinh(math.pi * (1 - 2 * yt / n)))
+    return _MERC_R * math.log(math.tan(math.pi / 4 + latd / 2))
+
+
+def write_imagery_tiles(tif_path, out_dir, max_zoom=None, workers=6):
+    """影像 GeoTIFF (EPSG:3857) → 本地 XYZ 瓦片金字塔 out_dir/{z}/{x}/{y}.jpg。
+
+    供 --offline 预览页使用, 投标/汇报现场无网可用。返回
+    {"tiles": N, "zmin": z0, "zmax": z1, "mb": 大小}。
+    """
+    import threading
+    import rasterio
+    from rasterio.windows import from_bounds as _win_bounds
+    from PIL import Image
+
+    src = rasterio.open(tif_path)
+    b = src.bounds
+    if str(src.crs) != "EPSG:3857":
+        log(f"[!] 影像 CRS 是 {src.crs} 非 EPSG:3857, 离线瓦片跳过")
+        return None
+    lat_mid = _merc_y2lat((b.bottom + b.top) / 2)
+    res = src.res[0]
+    z_auto = round(math.log2(40075016.68 * math.cos(math.radians(lat_mid)) / (res * 256)))
+    z_max = max(3, min(19, max_zoom or z_auto))
+    # 注意: UrlTemplateImageryProvider.minimumLevel > 0 在 Cesium 1.142 会触发
+    # "Too many properties to enumerate" 渲染崩溃, 因此 provider 一律 minimumLevel 0,
+    # 低缩放瓦片直接多生成几级 (越远级数越少, 仅十几张) 保证远处也有影像。
+    z_min = max(0, z_max - 6)
+    lon0, lon1 = math.degrees(b.left / _MERC_R), math.degrees(b.right / _MERC_R)
+    n_total = 0
+    os.makedirs(out_dir, exist_ok=True)
+    tl = threading.local()
+
+    def _get_src():
+        if not hasattr(tl, "src"):
+            tl.src = rasterio.open(tif_path)
+        return tl.src
+
+    def _one(job):
+        z, x, y = job
+        n = 2 ** z
+        left = (x / n * 360 - 180) / 180 * math.pi * _MERC_R
+        right = ((x + 1) / n * 360 - 180) / 180 * math.pi * _MERC_R
+        top = _tile_y2merc(y, z)
+        bottom = _tile_y2merc(y + 1, z)
+        s = _get_src()
+        win = _win_bounds(left, bottom, right, top, s.transform)
+        win = win.round_offsets().round_lengths()
+        if win.width < 1 or win.height < 1:
+            return 0
+        arr = s.read(window=win, boundless=True, fill_value=0)
+        img = Image.fromarray(arr.transpose(1, 2, 0), "RGB").resize((256, 256), Image.BILINEAR)
+        td = os.path.join(out_dir, str(z), str(x))
+        os.makedirs(td, exist_ok=True)
+        img.save(os.path.join(td, f"{y}.jpg"), quality=82)
+        return 1
+
+    jobs = []
+    for z in range(z_min, z_max + 1):
+        n = 2 ** z
+        x0 = int((lon0 + 180) / 360 * n)
+        x1 = int((lon1 + 180) / 360 * n)
+        y0 = int(_lat2tile_y(_merc_y2lat(b.top), z))
+        y1 = int(_lat2tile_y(_merc_y2lat(b.bottom), z))
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                jobs.append((z, x, y))
+    if workers > 1:
+        with concurrent.futures.ThreadPoolExecutor(workers) as ex:
+            for done in ex.map(_one, jobs):
+                n_total += done
+    else:
+        for j in jobs:
+            n_total += _one(j)
+    mb = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(out_dir) for f in fs) / 1048576
+    log(f"[✓] 离线影像瓦片: {out_dir}  ({n_total} 张 z{z_min}-z{z_max}, {mb:.0f} MB)")
+    return {"tiles": n_total, "zmin": z_min, "zmax": z_max, "mb": round(mb, 1)}
+
+
+def ensure_local_cesium(scene_dir):
+    """CesiumJS 1.142 本地化: 首次从 npmmirror tgz 解到 ~/.cache/cesium-1.142,
+    再复制进 scene_dir/cesium/, 输出目录完全自包含 (无网打开)。"""
+    cache = os.path.expanduser("~/.cache/cesium-1.142")
+    if not os.path.isfile(os.path.join(cache, "Cesium.js")):
+        os.makedirs(cache, exist_ok=True)
+        tgz = os.path.join(cache, "cesium.tgz")
+        if not os.path.isfile(tgz):
+            import requests
+            log("[*] 下载 CesiumJS 1.142 (npmmirror, 约 50MB) ...")
+            with requests.get(CESIUM_TGZ, stream=True, timeout=600) as r:
+                r.raise_for_status()
+                with open(tgz, "wb") as fh:
+                    for chunk in r.iter_content(1 << 20):
+                        fh.write(chunk)
+        import tarfile
+        with tarfile.open(tgz) as tf:
+            for m in tf.getmembers():
+                if m.name.startswith("package/Build/Cesium/") and m.isfile():
+                    m.name = m.name[len("package/Build/Cesium/"):]
+                    tf.extract(m, cache, filter="data")
+        os.remove(tgz)
+    dest = os.path.join(scene_dir, "cesium")
+    if not os.path.isdir(dest):
+        log("[*] 复制 CesiumJS 到输出目录 (约 80MB, 输出目录自包含) ...")
+        shutil.copytree(cache, dest)
+    return dest
+
+
+def write_terrain_tiles(dem_tif, out_dir, max_zoom=16, min_zoom=0):
+    """GLO-30 DEM (EPSG:4326) → Cesium heightmap-1.0 本地地形瓦片 terrain/。
+
+    GeographicTilingScheme (z 级 = 2^(z+1) 列 x 2^z 行), scheme=tms ({y} 南起),
+    每瓦片 65x65 Uint16LE 高度格 + childTileMask + 1 字节水mask(全陆地)。
+    高度编码用 ion 约定 u16=(h_m+1000)*5; GLO-30 正高直接当椭球高使用
+    (忽略大地水准面差距, 与预览绝对高程模式一致, 崩溃风险字段全部从
+    Cesium 1.142 源码核对: fIt 解包函数 + heightmapStructure 默认值)。
+    layer.json 不写 available (缺省时 Cesium 对 404 瓦片按不可用处理)。
+    min_zoom 必须 0: Cesium 地形四叉树从 z0 根瓦片下降, 缺根则整棵树不加载。
+    """
+    import numpy as np
+    import rasterio
+    src = rasterio.open(dem_tif)
+    if str(src.crs) != "EPSG:4326":
+        log(f"[!] DEM CRS 是 {src.crs} 非 EPSG:4326, 本地地形跳过")
+        return None
+    b = src.bounds
+    H = 65
+    tdir = os.path.join(out_dir, "terrain")
+    os.makedirs(tdir, exist_ok=True)
+    a_px, c0 = src.transform.a, src.transform.c
+    e_px, f0 = src.transform.e, src.transform.f   # e 为负 (north-up)
+    nod = src.nodata
+    us = (np.arange(H) + 0.5) / H
+    n_tiles = 0
+    mb = 0.0
+    for z in range(min_zoom, max_zoom + 1):
+        tw = 360.0 / 2 ** (z + 1)
+        th = 180.0 / 2 ** z
+        x0 = int(math.floor((b.left + 180) / tw)); x1 = int(math.floor((b.right + 180) / tw))
+        y0 = int(math.floor((b.bottom + 90) / th)); y1 = int(math.floor((b.top + 90) / th))
+        lons = None
+        for x in range(x0, x1 + 1):
+            for y in range(y0, y1 + 1):
+                w, e_ = -180 + x * tw, -180 + (x + 1) * tw
+                s_, n_ = -90 + y * th, -90 + (y + 1) * th
+                if lons is None:
+                    lats1d = n_ - us * (n_ - s_)
+                    LON, LAT = np.meshgrid(w + us * (e_ - w), lats1d)  # 行0=北缘
+                    col = (LON - c0) / a_px
+                    row = (f0 - LAT) / (-e_px)
+                    c0i = np.floor(col).astype(int)
+                    r0i = np.floor(row).astype(int)
+                    fc = col - c0i
+                    fr = row - r0i
+                # 双线性取 DEM 四邻, 越界/无效用最近有效值兜底
+                h = np.full((H, H), 0.0)
+                num = np.zeros((H, H))
+                den = np.zeros((H, H))
+                for drow, dcol, wgt in ((0, 0, (1 - fr) * (1 - fc)), (1, 0, fr * (1 - fc)),
+                                        (0, 1, (1 - fr) * fc), (1, 1, fr * fc)):
+                    rr = np.clip(r0i + drow, 0, src.height - 1)
+                    cc = np.clip(c0i + dcol, 0, src.width - 1)
+                    v = src.read(1, window=rasterio.windows.Window(int(cc.min()), int(rr.min()),
+                                                                   int(cc.max() - cc.min() + 1),
+                                                                   int(rr.max() - rr.min() + 1)))
+                    vfull = np.zeros((H, H))
+                    sel_v = v[rr - int(rr.min()), cc - int(cc.min())]
+                    valid = np.ones(sel_v.shape, bool)
+                    if nod is not None:
+                        valid = sel_v != nod
+                    vfull[valid] = sel_v[valid]
+                    wfull = wgt * valid
+                    num += wfull * vfull
+                    den += wfull
+                h = np.where(den > 1e-9, num / np.maximum(den, 1e-9), 0.0)
+                mask = 0
+                tw2, th2 = tw / 2, th / 2
+                for dx, dy, bit in ((0, 1, 1), (1, 1, 0), (0, 0, 2), (1, 0, 3)):  # NW NE SW SE
+                    cw, ce = -180 + (2 * x + dx) * tw2, -180 + (2 * x + dx + 1) * tw2
+                    cs, cn = -90 + (2 * y + dy) * th2, -90 + (2 * y + dy + 1) * th2
+                    if cw <= b.right and ce >= b.left and cs <= b.top and cn >= b.bottom:
+                        mask |= 1 << bit
+                vals = np.clip(np.round((h + 1000.0) * 5.0), 0, 65535).astype("<u2")
+                td = os.path.join(tdir, str(z), str(x))
+                os.makedirs(td, exist_ok=True)
+                with open(os.path.join(td, f"{y}.terrain"), "wb") as fh:
+                    fh.write(vals.tobytes() + bytes([mask, 0]))   # 高度格 + childTileMask + 水mask=陆地
+                n_tiles += 1
+                mb += len(vals) * 2 + 2
+    layer = {"tilejson": "2.1.0", "format": "heightmap-1.0", "version": "1.0.0",
+             "scheme": "tms", "tiles": ["{z}/{x}/{y}.terrain"], "maxzoom": max_zoom,
+             "attribution": "Copernicus GLO-30 DEM", "projection": "EPSG:4326"}
+    lp = os.path.join(tdir, "layer.json")
+    with open(lp, "w", encoding="utf-8") as fh:
+        json.dump(layer, fh, ensure_ascii=False, indent=1)
+    mb /= 1048576
+    log(f"[✓] 本地地形瓦片: {lp}  ({n_tiles} 块 z{min_zoom}-z{max_zoom}, {mb:.1f} MB)")
+    return {"tiles": n_tiles, "zmin": min_zoom, "zmax": max_zoom,
+            "mb": round(mb, 1), "url": "terrain/layer.json"}
+
+
 # ---------------------------------------------------------------- 5. 预览页
 
 PREVIEW_TPL = r"""<!DOCTYPE html>
@@ -1214,9 +1433,7 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>__NAME__ — 场景基础数据预览</title>
-<script>window.CESIUM_BASE_URL="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/";</script>
-<script src="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/Cesium.js"></script>
-<link href="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">
+__CESIUM_HEAD__
 <style>
   html,body,#cesium{width:100%;height:100%;margin:0;padding:0;overflow:hidden;background:#000;}
   #panel{position:absolute;top:12px;left:12px;z-index:9;background:rgba(20,30,40,.88);color:#eee;
@@ -1269,6 +1486,7 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   <label style="margin-top:6px"><input type="checkbox" id="ckTiles" checked> 建筑·纹理白模（3D Tiles 离线包）</label>
   <label><input type="checkbox" id="ckGeo"> 白模·按高度配色（GeoJSON）</label>
   <label><input type="checkbox" id="ckAbs"> 绝对高程模式（接真实地形时勾选；默认贴地预览）</label>
+  __TERRAIN_HTML__
   <div class="presets">
     <button data-p="tex" title="只看纹理 3D Tiles">纹理模式</button><button data-p="heat" title="只看按高度配色的 GeoJSON 白模">高度分析</button><button data-p="all" title="两层叠加">全部显示</button>
   </div>
@@ -1276,7 +1494,7 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   <div id="layers"></div>
   <div class="meta">
     中心: __LON__, __LAT__<br>
-    影像: ESRI World Imagery 在线瓦片<br>
+    影像: __IMG_DESC__<br>
     建筑: <span id="cnt">…</span> 栋（OSM 轮廓, 高度估算见信息卡）<br>
     高程底座: Copernicus GLO-30<br>
     <div id="summary"></div>
@@ -1288,10 +1506,9 @@ const LON=__LON__, LAT=__LAT__, RADIUS=__RADIUS__;
 const LON0=__LON__, LAT0=__LAT__, MEDBASE=__MEDBASE__;
 const EXTRAS_META = __EXTRAS__;   // {文件名: 要素数}
 Cesium.Ion.defaultAccessToken = undefined;
-const viewer = new Cesium.Viewer("cesium", {
-  baseLayer: new Cesium.ImageryLayer(new Cesium.UrlTemplateImageryProvider({
-    url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
-    maximumLevel: 18, credit: "Esri, Maxar"
+const viewer = new Cesium.Viewer("cesium", {  baseLayer: new Cesium.ImageryLayer(new Cesium.UrlTemplateImageryProvider({
+    url: __IMG_URL__,
+    minimumLevel: __IMG_MIN__, maximumLevel: __IMG_MAX__, credit: "Esri, Maxar (__IMG_MODE__)"
   })),
   terrainProvider: new Cesium.EllipsoidTerrainProvider(),
   baseLayerPicker: false, geocoder: false, homeButton: false,
@@ -1299,6 +1516,7 @@ const viewer = new Cesium.Viewer("cesium", {
   animation: false, timeline: false, fullscreenButton: false, infoBox: false,
   selectionIndicator: false
 });
+window.__viewer = viewer;   // 诊断/验收脚本用
 
 function rampColor(h){
   if(h<6)   return Cesium.Color.fromCssColorString("#dfe7ee");
@@ -1309,17 +1527,19 @@ function rampColor(h){
 
 // 贴地/绝对高程模式。base_m 是 DEM 绝对高程, 椭球地形(0m)下直接用会悬空,
 // 贴地模式把底座归零; 3D Tiles 用 modelMatrix 沿 ECEF "向下"平移。
-let geoSrc = null, tiles = null;
+// 勾选本地地形后, 高度基准与地形一致, 等效绝对高程。
+let geoSrc = null, tiles = null, terrainOn = false, terrainProv = null;
 function applyMode(absolute){
+  const abs = absolute || terrainOn;
   if (geoSrc) for (const ent of geoSrc.entities.values) {
     const p = ent.properties;
     const base = p.base_m ? p.base_m.getValue() : 0;
     const top  = p.top_m  ? p.top_m.getValue()  : base + 6;
-    ent.polygon.height = absolute ? base : 0.15;          // +0.15m 防与 3D Tiles 重叠闪烁
-    ent.polygon.extrudedHeight = absolute ? top : top - base;
+    ent.polygon.height = abs ? base : 0.15;          // +0.15m 防与 3D Tiles 重叠闪烁
+    ent.polygon.extrudedHeight = abs ? top : top - base;
   }
   if (tiles) {
-    if (absolute) { tiles.modelMatrix = Cesium.Matrix4.IDENTITY; }
+    if (abs) { tiles.modelMatrix = Cesium.Matrix4.IDENTITY; }
     else {
       const up = Cesium.Cartesian3.normalize(
         Cesium.Cartesian3.fromDegrees(LON0, LAT0), new Cesium.Cartesian3());
@@ -1616,6 +1836,7 @@ async function loadGreen(file) {
     document.getElementById("ckTiles").onchange = e => { if(tiles) tiles.show = e.target.checked; };
     document.getElementById("ckAbs").onchange = e => applyMode(e.target.checked);
     applyMode(false);  // 默认贴地模式
+__TERRAIN_JS__
 
     // 初始视角: 42° 斜视, 更有三维感 (比正俯视好看)
     const dLat = RADIUS/111320, dLon = RADIUS/(111320*Math.cos(LAT*Math.PI/180));
@@ -1624,7 +1845,7 @@ async function loadGreen(file) {
       orientation: { heading: 0, pitch: Cesium.Math.toRadians(-42), roll: 0 },
       duration: 1.8
     });
-    if (st.textContent.indexOf("加载") === 0) st.textContent = "就绪 ✓（在线影像需可访问 arcgisonline.com）";
+    if (st.textContent.indexOf("加载") === 0) st.textContent = "就绪 ✓__READY_NOTE__";
   } catch(e) { st.textContent = "初始化失败: " + e; }
 })();
 </script>
@@ -1637,11 +1858,53 @@ cd "$(dirname "$0")" && exec python3 -m http.server "${1:-8000}"
 """
 
 
-def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0, extras=None):
+def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0, extras=None, offline=None):
+    if offline:
+        head = ('<script>window.CESIUM_BASE_URL="cesium/";</script>\n'
+                '<script src="cesium/Cesium.js"></script>\n'
+                '<link href="cesium/Widgets/widgets.css" rel="stylesheet">')
+        img_url = json.dumps("tiles/{z}/{x}/{y}.jpg")
+        img_min, img_max = 0, offline["zmax"]   # minimumLevel 必须 0 (见 write_imagery_tiles 注释)
+        img_mode, img_desc = "离线", f"本地离线瓦片 (z{offline['zmin']}-z{offline['zmax']}, {offline['tiles']} 张)"
+        ready_note = "（离线包: Cesium 与影像均为本地文件, 无网可用）"
+    else:
+        head = ('<script>window.CESIUM_BASE_URL="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/";</script>\n'
+                '<script src="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/Cesium.js"></script>\n'
+                '<link href="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet">')
+        img_url = json.dumps("https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}")
+        img_min, img_max = 0, 18
+        img_mode, img_desc = "在线", "ESRI World Imagery 在线瓦片"
+        ready_note = "（在线影像需可访问 arcgisonline.com）"
+    if offline and offline.get("terrain"):
+        terrain_html = ('<label style="display:none" id="ckTerrRow">'
+                        '<input type="checkbox" id="ckTerr"> 地形: GLO-30 本地瓦片</label>')
+        terrain_js = """
+    document.getElementById("ckTerrRow").style.display = "";
+    document.getElementById("ckTerr").onchange = async e => {
+      terrainOn = e.target.checked;
+      if (terrainOn && !terrainProv) {
+        st.textContent = "加载本地地形…";
+        try { terrainProv = await Cesium.CesiumTerrainProvider.fromUrl("terrain/"); }
+        catch (err) { st.textContent = "地形加载失败: " + err; terrainOn = false; e.target.checked = false; }
+        if (terrainProv) st.textContent = "地形就绪 ✓（本地 GLO-30）";
+      }
+      viewer.scene.terrainProvider = terrainOn ? terrainProv : new Cesium.EllipsoidTerrainProvider();
+      applyMode(document.getElementById("ckAbs").checked);
+    };"""
+    else:
+        terrain_html = terrain_js = ""
     html = (PREVIEW_TPL.replace("__NAME__", name).replace("__LON__", repr(lon))
             .replace("__LAT__", repr(lat)).replace("__RADIUS__", repr(radius_m))
             .replace("__MEDBASE__", repr(round(float(median_base), 2)))
-            .replace("__EXTRAS__", json.dumps(extras or {})))
+            .replace("__EXTRAS__", json.dumps(extras or {}))
+            .replace("__CESIUM_HEAD__", head)
+            .replace("__IMG_URL__", img_url)
+            .replace("__IMG_MIN__", str(img_min)).replace("__IMG_MAX__", str(img_max))
+            .replace("__IMG_MODE__", img_mode)
+            .replace("__IMG_DESC__", img_desc)
+            .replace("__READY_NOTE__", ready_note)
+            .replace("__TERRAIN_HTML__", terrain_html)
+            .replace("__TERRAIN_JS__", terrain_js))
     html_path = os.path.join(out_dir, "cesium_preview.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -1685,6 +1948,9 @@ def main():
     ap.add_argument("--heights", choices=["cnbh"], default=None,
                     help="建筑高度注入: cnbh = CNBH-10m 栅格估算 (Zenodo 7923866, "
                          "需外网或代理, 瓦片缓存 ~/.cache/cnbh10m); OSM height 标签优先保留")
+    ap.add_argument("--offline", action="store_true",
+                    help="离线预览包: 影像转本地 XYZ 瓦片 + CesiumJS 本地化, "
+                         "输出目录无网可用 (投标/汇报现场)")
     ap.add_argument("--resume", action="store_true",
                     help="断点续传: 复用输出目录已有的影像/DEM/建筑/配套图层, 只重做 3D Tiles/预览/报告")
     args = ap.parse_args()
@@ -1893,12 +2159,25 @@ def main():
             buildings_info["3d_tiles"] = tiles_info
 
     # 5. 预览页
+    offline_info = None
+    if args.offline:
+        img_tif = os.path.join(out_dir, f"imagery_z{args.zoom}_{args.source}.tif")
+        if os.path.isfile(img_tif):
+            offline_info = write_imagery_tiles(img_tif, os.path.join(out_dir, "tiles"))
+            ensure_local_cesium(out_dir)
+            dem_tif = os.path.join(out_dir, "dem_glo30_30m.tif")
+            if offline_info and os.path.isfile(dem_tif):
+                offline_info["terrain"] = write_terrain_tiles(dem_tif, out_dir)
+            report["outputs"]["offline"] = offline_info
+        else:
+            log("[!] --offline 需要影像 GeoTIFF, 未找到, 预览页仍用在线瓦片")
     if not args.skip_preview:
         median_base = 0.0
         if buildings_info.get("count"):
             bases = sorted(f["properties"]["base_m"] for f in feats)
             median_base = bases[len(bases) // 2]
-        write_preview(out_dir, name, lon0, lat0, ext_m / 2, median_base, extras=extras_counts)
+        write_preview(out_dir, name, lon0, lat0, ext_m / 2, median_base, extras=extras_counts,
+                      offline=offline_info)
 
     report["outputs"]["buildings"] = buildings_info
     report["finished"] = datetime.datetime.now().isoformat(timespec="seconds")

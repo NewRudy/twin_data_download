@@ -63,6 +63,10 @@ http_proxy=http://127.0.0.1:58309 https_proxy=http://127.0.0.1:58309 all_proxy= 
 # 首次按度格下载瓦片 10-50MB 缓存 ~/.cache/cnbh10m, 需外网/代理)
 ... --heights cnbh
 
+# 离线预览包 (投标/汇报现场无网): 影像转本地 XYZ 瓦片 + CesiumJS 本地化
+# + GLO-30 本地地形, 输出目录自包含, 断网打开即用
+... --offline
+
 # 不要道路/水系/绿地配套图层
 ... --skip-extras
 ```
@@ -116,6 +120,9 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF transform, Cesium 直接加载
 │   ├── scene.b3dm            # ≤1500 栋: 单 tile；更多时改为 tiles/cell_*.b3dm 分块 (~350 栋/块)
+├── tiles/                    # --offline: 影像 XYZ 瓦片 z(native-6)-z(native) jpg
+├── cesium/                   # --offline: CesiumJS 1.142 本地副本 (~22MB)
+├── terrain/                  # --offline: GLO-30 heightmap-1.0 地形瓦片 + layer.json
 ├── cesium_preview.html       # 多图层预览（建筑/路网/水系/绿地独立开关）
 ├── serve.sh                  # python3 -m http.server 封装
 └── download_report.json      # 证据记录（含各图层要素数）
@@ -151,7 +158,12 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 - **z18≈0.6m 是 MODELED 估算值**（按纬度换算），实际成图质量取决于 Maxar 当地拍摄批次。
 - **Google 源在国内需要代理**；ESRI、Copernicus、Overpass 一般可直连。
   Overpass 限流时脚本会自动换端点（共 3 个）。
-- 预览页用 jsdelivr CDN 的 Cesium 1.142，离线环境需自备 Cesium 或改本地路径。
+- 预览页用 jsdelivr CDN 的 Cesium 1.142；`--offline` 时全部本地化（影像 XYZ 瓦片 +
+  cesium/ 目录 + terrain/ 地形），**无网可用**；但下载的 ESRI 影像衍生瓦片仅供
+  现场/内部演示预览，**不得再分发**（Esri 服务条款）。
+- `--offline` 地形：GLO-30 正高直接当椭球高（忽略大地水准面差距，平原误差约
+  ±10m 级），与绝对高程模式同一近似；heightmap-1.0 格式细节已按 Cesium 1.142
+  源码核对（65×65 Uint16LE 高度格 + childTileMask + 1 字节水mask，u16=(h+1000)*5）。
 - 产线环境（投标/汇报）引用这些数据时，按 [[evidence-boundary]] 标注层级，别说成"测绘级"。
 
 ## 已验证机器
@@ -174,6 +186,22 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
   保留 POLICY），高度分析预设从"清一色 6m 白板"变成真实城市高度梯度（商务区红≥24m、
   居住橙金、仓储绿）✓ 截图 acceptance/2026-11-05-cnbh-heights.png；面板/报告显示
   注入数✓。
+  **离线预览包 `--offline`**：影像 GeoTIFF→本地 XYZ jpg 瓦片（3403 张 z12-18, 66MB）
+  + CesiumJS 1.142 本地化（npmmirror tgz→~/.cache→复制进输出目录）+ 图层/3D Tiles
+  全部本地。浏览器验收：**外部请求数 0**、就绪状态✓ 截图 acceptance/2026-11-05-offline-preview.png。
+  **本地地形 `--offline` 附带**：GLO-30→heightmap-1.0 瓦片（789 块 z0-16），格式逐项
+  从 Cesium 1.142 源码核对（fIt 解包: 65×65 Uint16LE 高度格+childTileMask+1 字节水mask,
+  ion 编码 u16=(h+1000)*5）。排查三连：①**UrlTemplateImageryProvider.minimumLevel>0
+  在 Cesium 1.142 触发 "Too many properties to enumerate" 渲染崩溃**（二分定位:
+  本地瓦片+minLevel 崩, 本地无 minLevel 不崩, ESRI+minLevel 不崩）→ 影像 provider
+  minimumLevel 恒 0, 低缩放瓦片多生成几级兜底; ②**CesiumTerrainProvider.fromUrl
+  参数是瓦片目录**不是 layer.json 路径（传 layer.json 会变成 目录/layer.json/layer.json
+  404 并触发无 layer.json 的回退路径）; ③**地形四叉树必须从 z0 根下降**——只生成
+  z8+ 会卡"加载本地地形"（ getHeight 永远 undefined）, min_zoom=0 后 bbox 相交的
+  低级瓦片仅十几张。验收: 勾选地形后 globe.getHeight(中心)=4.39m（椭球模式下≈0）,
+  建筑随地形就位, 零外部请求✓ 截图 acceptance/2026-11-05-terrain.png。
+  另: 诊断脚本踩 const 作用域坑——页面内 `const viewer` 不挂 window, 跨轮 evaluate
+  访问不到, 模板已显式 `window.__viewer = viewer`。
   **配套图层 bug 修复**：水系/绿地面要素的 fromDegreesArray 被传入嵌套数组
   （RangeError: Invalid array length），被 per-layer try/catch 静默吞掉导致开关消失；
   改为正确遍历 Polygon 外环后 4 图层齐全✓（教训：图层加载失败不该静默，
