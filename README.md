@@ -7,9 +7,10 @@
 | 高清影像 | ESRI World Imagery (Maxar) / Google 卫星 | GeoTIFF (EPSG:3857)，z17≈1.2m、z18≈0.6m |
 | 高程 DEM | Copernicus GLO-30 | GeoTIFF (EPSG:4326)，标称 30m |
 | 建筑物 | OpenStreetMap（Overpass API） | GeoJSON（含高度估算） |
-| 3D 白模 | 由建筑轮廓挤出 | 3D Tiles 1.0（b3dm + tileset.json） |
-| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh |
-| 下载报告 | — | download_report.json（数据源/瓦片数/失败数/估算占比） |
+| 道路/铁路/水系/绿地 | OpenStreetMap（同一次 Overpass 查询） | 各自独立 GeoJSON，"OSM 提供啥就提取啥" |
+| 3D 白模 | 由建筑轮廓挤出（封闭屋顶） | 3D Tiles 1.0（b3dm + tileset.json） |
+| 三维预览 | CesiumJS 1.142 | 单文件 HTML + serve.sh，图层独立开关 |
+| 下载报告 | — | download_report.json（数据源/瓦片数/失败数/各图层要素数） |
 
 建筑数据**有就生成、没有就跳过**：OSM 覆盖不到的位置自动跳过建筑与 3D Tiles，
 影像和高程不受影响。
@@ -34,6 +35,7 @@ bash setup_env.sh                      # 创建 ~/.venv_imagery 并装依赖（�
 --zoom 17             # 1.2m，更快（16-19；ESRI 无影像层级会自动探测降级）
 --source google       # Google 影像源（国内需代理）
 --skip-buildings      # 只要影像和高程
+--skip-extras         # 不要道路/铁路/水系/绿地配套图层
 --skip-3dtiles --skip-preview
 --name 场景名 --out 输出目录
 ```
@@ -45,8 +47,8 @@ cd <输出目录> && ./serve.sh
 # 浏览器打开 http://localhost:8000/cesium_preview.html
 ```
 
-预览页支持两个图层独立开关（GeoJSON 白模 / 3D Tiles 离线包），默认**贴地模式**；
-接真实地形渲染时勾选「绝对高程模式」。
+预览页支持建筑双图层 + 道路/铁路/水系/绿地图层的独立开关（道路按等级分色分宽，
+水系线/面蓝色、绿地半透明），默认**贴地模式**；接真实地形渲染时勾选「绝对高程模式」。
 
 ## 输出结构
 
@@ -55,6 +57,10 @@ cd <输出目录> && ./serve.sh
 ├── imagery_z18_esri.tif      # 高清影像
 ├── dem_glo30_30m.tif         # 高程
 ├── buildings.geojson         # 建筑轮廓 + height_m/base_m/top_m
+├── roads.geojson             # OSM 道路（class/name/bridge/tunnel）
+├── railways.geojson          # OSM 铁路/轨交
+├── water.geojson             # 水系（河流线 + 湖泊面）
+├── green.geojson             # 绿地（公园/草坪/林地/球场）
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF，Cesium 直接加载
 │   └── scene.b3dm

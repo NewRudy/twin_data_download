@@ -385,23 +385,139 @@ def make_dem_sampler(dem_path):
 
 # ---------------------------------------------------------------- 3. 建筑物
 
-def fetch_buildings_osm(w, s, e, n, endpoints=None, timeout=90):
+def fetch_osm(w, s, e, n, endpoints=None, timeout=150):
+    """一次拉取建筑+道路+铁路+水系+绿地 (分层解析在前端做)。"""
     query = (f"[out:json][timeout:{timeout}];"
-             f"(way[\"building\"]({s},{w},{n},{e});"
-             f"relation[\"building\"]({s},{w},{n},{e}););out geom;")
+             f"(way[\"building\"]({s},{w},{n},{e});relation[\"building\"]({s},{w},{n},{e});"
+             f"way[\"highway\"]({s},{w},{n},{e});"
+             f"way[\"railway\"~\"^(rail|light_rail|subway|tram|monorail)$\"]({s},{w},{n},{e});"
+             f"way[\"waterway\"]({s},{w},{n},{e});"
+             f"way[\"natural\"=\"water\"]({s},{w},{n},{e});relation[\"natural\"=\"water\"]({s},{w},{n},{e});"
+             f"way[\"landuse\"~\"^(reservoir|basin|grass|forest|meadow|village_green)$\"]({s},{w},{n},{e});"
+             f"way[\"leisure\"~\"^(park|garden|pitch|golf_course)$\"]({s},{w},{n},{e});"
+             f"relation[\"leisure\"~\"^(park|garden|golf_course)$\"]({s},{w},{n},{e});"
+             f");out geom;")
     endpoints = endpoints or OVERPASS_ENDPOINTS
     for url in endpoints:
         try:
-            log(f"[*] 建筑: 查询 Overpass ({url}) ...")
-            r = requests.post(url, data={"data": query}, timeout=timeout + 30,
+            log(f"[*] 建筑/道路/水系/绿地: 查询 Overpass ({url}) ...")
+            r = requests.post(url, data={"data": query}, timeout=timeout + 60,
                               headers={"User-Agent": "gis-data-download/1.0"})
             if r.status_code == 200:
-                data = r.json()
-                return data.get("elements", []), url
+                return r.json().get("elements", []), url
             log(f"[!]   HTTP {r.status_code}, 换下一个端点")
         except Exception as ex:
             log(f"[!]   失败: {ex}, 换下一个端点")
     return None, None
+
+
+def relation_rings(el):
+    """relation multipolygon → [[外环, 洞...], ...] (未闭合成员环暂不拼接)。"""
+    outers, inners = [], []
+    for m in el.get("members") or []:
+        if m.get("type") != "way" or not m.get("geometry"):
+            continue
+        pts = [(p["lon"], p["lat"]) for p in m["geometry"]]
+        if len(pts) < 4 or pts[0] != pts[-1]:
+            continue
+        (outers if m.get("role") != "inner" else inners).append(pts)
+    inner_polys = [Polygon(r) for r in inners]
+    result = []
+    for out in outers:
+        op = Polygon(out)
+        if not op.is_valid:
+            op = op.buffer(0)
+        if op.is_empty or op.geom_type != "Polygon":
+            continue
+        holes = [list(ip.exterior.coords)[:-1] for ip in inner_polys
+                 if op.contains(ip.representative_point())]
+        result.append([list(out)] + holes)
+    return result
+
+
+def _area_m2(ring_lonlat):
+    poly = Polygon(ring_lonlat)
+    cen = poly.centroid
+    return poly.area * 111320.0 ** 2 * math.cos(math.radians(cen.y))
+
+
+def osm_extras_to_features(elements):
+    """非建筑要素 → {roads, railways, water, green} 四个 GeoJSON 图层。"""
+    roads, rails, water, green = [], [], [], []
+
+    def line_feat(pts, props):
+        return {"type": "Feature",
+                "geometry": {"type": "LineString",
+                             "coordinates": [[p["lon"], p["lat"]] for p in pts]},
+                "properties": props}
+
+    def poly_feat(rings, props):
+        return {"type": "Feature",
+                "geometry": {"type": "Polygon",
+                             "coordinates": [[list(p) for p in r] for r in rings]},
+                "properties": props}
+
+    def closed_ring(geom):
+        pts = [(p["lon"], p["lat"]) for p in geom]
+        if len(pts) < 4:
+            return None
+        if pts[0] != pts[-1]:
+            pts.append(pts[0])
+        return pts
+
+    for el in elements:
+        tags = el.get("tags") or {}
+        if tags.get("building"):
+            continue
+        eid = el.get("id")
+        geom = el.get("geometry") or []
+        if el["type"] == "way" and len(geom) < 2:
+            continue
+
+        if tags.get("highway"):
+            roads.append(line_feat(geom, {
+                "class": tags["highway"], "name": tags.get("name", ""),
+                "bridge": tags.get("bridge", "no"), "tunnel": tags.get("tunnel", "no"),
+                "osm_id": eid}))
+        elif tags.get("railway") in {"rail", "light_rail", "subway", "tram", "monorail"}:
+            rails.append(line_feat(geom, {
+                "class": tags["railway"], "name": tags.get("name", ""), "osm_id": eid}))
+        elif tags.get("waterway"):
+            water.append(line_feat(geom, {
+                "kind": "line", "class": tags["waterway"],
+                "name": tags.get("name", ""), "osm_id": eid}))
+        else:
+            ring = closed_ring(geom) if el["type"] == "way" else None
+            if tags.get("natural") == "water" or tags.get("landuse") in {"reservoir", "basin"}:
+                if ring and _area_m2(ring) >= 30:
+                    water.append(poly_feat([ring], {
+                        "kind": "area", "class": tags.get("landuse", "water"),
+                        "name": tags.get("name", ""), "osm_id": eid}))
+            elif (tags.get("landuse") in {"grass", "forest", "meadow", "village_green"}
+                  or tags.get("leisure") in {"park", "garden", "pitch", "golf_course"}):
+                if ring and _area_m2(ring) >= 50:
+                    green.append(poly_feat([ring], {
+                        "class": tags.get("leisure") or tags.get("landuse"),
+                        "name": tags.get("name", ""), "osm_id": eid}))
+
+    for el in elements:
+        if el["type"] != "relation":
+            continue
+        tags = el.get("tags") or {}
+        eid = el.get("id")
+        if tags.get("natural") == "water":
+            for rings in relation_rings(el):
+                if _area_m2(rings[0]) >= 30:
+                    water.append(poly_feat(rings, {
+                        "kind": "area", "class": "water",
+                        "name": tags.get("name", ""), "osm_id": eid}))
+        elif tags.get("leisure") in {"park", "garden", "golf_course"}:
+            for rings in relation_rings(el):
+                if _area_m2(rings[0]) >= 50:
+                    green.append(poly_feat(rings, {
+                        "class": tags["leisure"], "name": tags.get("name", ""), "osm_id": eid}))
+
+    return {"roads": roads, "railways": rails, "water": water, "green": green}
 
 
 def parse_height(tags):
@@ -423,7 +539,7 @@ def parse_height(tags):
 
 
 def osm_to_features(elements, dem_sample):
-    """OSM elements → GeoJSON features (WGS84)。带高度估算与属性。"""
+    """OSM elements → 建筑 GeoJSON features (WGS84)。只取带 building 标签的要素。"""
     feats, stats = [], {"from": 0, "no_tag": 0, "skipped_small": 0, "skipped_open": 0}
 
     def make_ring(geom_pts):
@@ -475,6 +591,8 @@ def osm_to_features(elements, dem_sample):
 
     for el in elements:
         tags, eid = el.get("tags") or {}, el.get("id")
+        if not tags.get("building"):
+            continue
         if el["type"] == "way":
             ring = make_ring(el.get("geometry") or [])
             if ring:
@@ -482,43 +600,24 @@ def osm_to_features(elements, dem_sample):
             else:
                 stats["skipped_open"] += 1
         elif el["type"] == "relation":
-            outers, inners = [], []
-            for m in el.get("members") or []:
-                if m.get("type") != "way" or not m.get("geometry"):
-                    continue
-                ring = make_ring(m["geometry"])
-                if not ring:
-                    continue
-                (outers if m.get("role") != "inner" else inners).append(ring)
-            if not outers:
-                stats["skipped_open"] += 1
-                continue
-            inner_polys = []
-            for r in inners:
-                try:
-                    inner_polys.append(Polygon(r))
-                except Exception:
-                    pass
-            for out in outers:
-                holes = []
-                op = Polygon(out)
-                for ip in inner_polys:
-                    if op.contains(ip.representative_point()) or op.intersects(ip):
-                        holes.append(list(ip.exterior.coords)[:-1])
-                emit([out] + holes, tags, eid)
+            for rings in relation_rings(el):
+                emit(rings, tags, eid)
     return feats, stats
 
 
-def write_geojson(feats, out_path, bbox):
+def write_layer_geojson(feats, out_path, bbox, label="layer", extra_meta=None):
     fc = {"type": "FeatureCollection",
           "metadata": {"source": "OpenStreetMap via Overpass API",
+                       "layer": label,
                        "bbox_wgs84": [round(x, 6) for x in bbox],
-                       "height_policy": f"OSM height 标签 > building:levels×{FLOOR_HEIGHT} > 默认 {DEFAULT_HEIGHT}m (POLICY 估算)",
+                       "count": len(feats),
                        "generated": datetime.datetime.now().isoformat(timespec="seconds")},
           "features": feats}
+    if extra_meta:
+        fc["metadata"].update(extra_meta)
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(fc, f, ensure_ascii=False)
-    log(f"[✓] 建筑 GeoJSON: {out_path}  ({len(feats)} 栋)")
+    log(f"[✓] {label} GeoJSON: {out_path}  ({len(feats)} 要素)")
 
 
 # ---------------------------------------------------------------- 4. 3D Tiles
@@ -609,16 +708,16 @@ def write_3dtiles(feats, lon0, lat0, out_dir, dem_info):
         def gl(v):  # ENU(x=e, y=n, z=up) → glTF(x=e, y=up, z=-n)
             return (v[0], v[2], -v[1])
 
-        # 屋顶
+        # 屋顶 (环已在 2D 归一化为逆时针; gl 映射 z=-n 后 (a,b,c) 顺序法线朝 +Y)
         for a, b, c in tris:
-            push_tri(gl(ring3d[a]), gl(ring3d[c]), gl(ring3d[b]))  # 顶面朝上
+            push_tri(gl(ring3d[a]), gl(ring3d[b]), gl(ring3d[c]))
         # 墙面
         m = len(ring3d)
         for i in range(m):
             v1, v2 = ring3d[i], ring3d[(i + 1) % m]
             v1t, v2t = (v1[0], v1[1], top), (v2[0], v2[1], top)
-            push_tri(gl(v1), gl(v1t), gl(v2))
-            push_tri(gl(v2), gl(v1t), gl(v2t))
+            push_tri(gl(v1), gl(v2), gl(v1t))
+            push_tri(gl(v2), gl(v2t), gl(v1t))
         for v in ring3d:
             max_e, max_n = max(max_e, v[0]), max(max_n, v[1])
             min_e, min_n = min(min_e, v[0]), min(min_n, v[1])
@@ -689,6 +788,7 @@ PREVIEW_TPL = r"""<!DOCTYPE html>
   <label><input type="checkbox" id="ckGeo" checked> 建筑 GeoJSON 白模（可改样式）</label>
   <label><input type="checkbox" id="ckTiles" checked> 建筑 3D Tiles（离线包）</label>
   <label><input type="checkbox" id="ckAbs"> 绝对高程模式（接真实地形时勾选；默认贴地预览）</label>
+  <div id="layers"></div>
   <div class="meta">
     中心: __LON__, __LAT__<br>
     影像: ESRI World Imagery 在线瓦片<br>
@@ -742,6 +842,44 @@ function applyMode(absolute){
   }
 }
 
+// 配套图层样式（道路按等级分色分宽；水系线/面；绿地半透明）
+const ROAD_STYLE = {
+  motorway:  [5.0, "#f7b731"], trunk: [4.5, "#f7b731"],
+  primary:   [4.0, "#ffffff"], secondary: [3.5, "#eef3f6"],
+  tertiary:  [2.5, "#e8eef2"], residential: [1.8, "#cfd8dc"],
+  unclassified: [1.8, "#cfd8dc"], service: [1.2, "#b8c2c8"],
+  living_street: [1.5, "#c8d2d8"], pedestrian: [1.2, "#d8dee2"]
+};
+function styleRoad(ent){
+  const cls = ent.properties.class ? ent.properties.class.getValue() : "default";
+  const st = ROAD_STYLE[cls] || [2.5, "#cfd8dc"];
+  ent.polyline.width = st[0];
+  ent.polyline.material = Cesium.Color.fromCssColorString(st[1]).withAlpha(0.95);
+}
+function styleRail(ent){
+  ent.polyline.width = 2.5;
+  ent.polyline.material = Cesium.Color.fromCssColorString("#9aa4b0").withAlpha(0.9);
+}
+function styleWater(ent){
+  if (ent.polygon) {
+    ent.polygon.height = 0.08;
+    ent.polygon.material = Cesium.Color.fromCssColorString("#3d9bff").withAlpha(0.85);
+    ent.polygon.outline = false;
+  } else if (ent.polyline) {
+    const cls = ent.properties.class ? ent.properties.class.getValue() : "stream";
+    const w = { river: 5, canal: 4, stream: 2.5, ditch: 1.5 }[cls] || 2.5;
+    ent.polyline.width = w;
+    ent.polyline.material = Cesium.Color.fromCssColorString("#3d9bff").withAlpha(0.85);
+  }
+}
+function styleGreen(ent){
+  if (ent.polygon) {
+    ent.polygon.height = 0.06;
+    ent.polygon.material = Cesium.Color.fromCssColorString("#69a854").withAlpha(0.45);
+    ent.polygon.outline = false;
+  }
+}
+
 (async () => {
   const st = document.getElementById("status");
   try {
@@ -764,6 +902,30 @@ function applyMode(absolute){
       viewer.scene.primitives.add(tiles);
     } catch(e) { st.textContent = "3D Tiles 加载失败: " + e; }
 
+    // OSM 配套图层（存在才加载，动态生成开关）
+    const EXTRAS = [
+      { file: "roads.geojson",    label: "道路路网", style: styleRoad },
+      { file: "railways.geojson", label: "铁路轨道", style: styleRail },
+      { file: "water.geojson",    label: "水系",     style: styleWater },
+      { file: "green.geojson",    label: "绿地",     style: styleGreen },
+    ];
+    const layerSrc = {};
+    for (const L of EXTRAS) {
+      try {
+        const ds = await Cesium.GeoJsonDataSource.load(L.file, { clampToGround: true });
+        for (const ent of ds.entities.values) L.style(ent);
+        viewer.dataSources.add(ds);
+        layerSrc[L.file] = ds;
+        const ck = document.createElement("label");
+        ck.innerHTML = `<input type="checkbox" checked data-f="${L.file}"> ${L.label}`;
+        document.getElementById("layers").appendChild(ck);
+      } catch(e) { /* 图层文件不存在则静默跳过 */ }
+    }
+    document.getElementById("layers").onchange = e => {
+      const f = e.target.dataset.f;
+      if (f && layerSrc[f]) layerSrc[f].show = e.target.checked;
+    };
+
     document.getElementById("ckGeo").onchange = e => { if(geoSrc) geoSrc.show = e.target.checked; };
     document.getElementById("ckTiles").onchange = e => { if(tiles) tiles.show = e.target.checked; };
     document.getElementById("ckAbs").onchange = e => applyMode(e.target.checked);
@@ -774,7 +936,7 @@ function applyMode(absolute){
       destination: Cesium.Rectangle.fromDegrees(LON-dLon*1.6, LAT-dLat*1.6, LON+dLon*1.6, LAT+dLat*1.6),
       duration: 1.5
     });
-    st.textContent = "就绪 ✓（在线影像需可访问 arcgisonline.com）";
+    if (st.textContent.indexOf("加载") === 0) st.textContent = "就绪 ✓（在线影像需可访问 arcgisonline.com）";
   } catch(e) { st.textContent = "初始化失败: " + e; }
 })();
 </script>
@@ -827,6 +989,8 @@ def main():
     ap.add_argument("--skip-buildings", action="store_true")
     ap.add_argument("--skip-3dtiles", action="store_true")
     ap.add_argument("--skip-preview", action="store_true")
+    ap.add_argument("--skip-extras", action="store_true",
+                    help="不提取道路/铁路/水系/绿地等 OSM 配套图层")
     args = ap.parse_args()
 
     DEFAULT_HEIGHT = args.default_height
@@ -918,24 +1082,39 @@ def main():
     else:
         dem_path, dem_info = None, {}
 
-    # 3. 建筑
+    # 3. 建筑 + OSM 配套图层 (道路/铁路/水系/绿地)
     dem_sample = make_dem_sampler(dem_path)
     buildings_info = {}
     if not args.skip_buildings:
-        elements, used_ep = fetch_buildings_osm(w, s, e, n)
+        elements, used_ep = fetch_osm(w, s, e, n)
         if elements is None:
-            log("[-] 建筑: 所有 Overpass 端点失败 (国内可尝试加 astar 代理)")
+            log("[-] OSM: 所有 Overpass 端点失败 (国内可尝试加 astar 代理)")
             buildings_info = {"error": "overpass unreachable"}
         else:
             feats, stats = osm_to_features(elements, dem_sample)
             geo_path = os.path.join(out_dir, "buildings.geojson")
-            write_geojson(feats, geo_path, (w, s, e, n))
+            write_layer_geojson(feats, geo_path, (w, s, e, n), "建筑", {
+                "height_policy": f"OSM height 标签 > building:levels×{FLOOR_HEIGHT} > 默认 {DEFAULT_HEIGHT}m (POLICY 估算)",
+                "unit": "栋"})
             buildings_info = {"endpoint_used": used_ep, "count": len(feats),
                               "height_from_osm_tag": stats["from"],
                               "height_policy_estimate": stats["no_tag"],
                               "skipped_small": stats["skipped_small"],
                               "skipped_invalid": stats["skipped_open"]}
             log(f"[*]   高度来源: OSM 标签 {stats['from']} 栋, POLICY 估算 {stats['no_tag']} 栋")
+
+            if not args.skip_extras:
+                layers = osm_extras_to_features(elements)
+                layer_counts = {}
+                layer_labels = {"roads": "道路路网", "railways": "铁路轨道",
+                                "water": "水系", "green": "绿地"}
+                for lname, fts in layers.items():
+                    layer_counts[lname] = len(fts)
+                    if fts:
+                        write_layer_geojson(fts, os.path.join(out_dir, f"{lname}.geojson"),
+                                            (w, s, e, n), layer_labels[lname], {"unit": "要素"})
+                buildings_info["layers"] = layer_counts
+                log(f"[*]   配套图层: " + ", ".join(f"{k} {v}" for k, v in layer_counts.items()))
 
             # 4. 3D Tiles
             if not args.skip_3dtiles and feats:

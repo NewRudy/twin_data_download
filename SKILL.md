@@ -1,6 +1,6 @@
 ---
 name: gis-data-download
-description: 按坐标点一键下载数字孪生场景基础数据——高清影像、高程 DEM、建筑物轮廓+高度，打包成 GeoTIFF/GeoJSON/Cesium 3D Tiles 离线包并附三维预览页。当用户要下载卫星影像、遥感影像、高程数据、DEM、建筑轮廓、白模，或要为数字孪生/Cesium 场景准备基础数据时使用。
+description: 按坐标点一键下载数字孪生场景基础数据——高清影像、高程 DEM、建筑物轮廓+高度、道路/铁路/水系/绿地配套图层，打包成 GeoTIFF/GeoJSON/Cesium 3D Tiles 离线包并附三维预览页。当用户要下载卫星影像、遥感影像、高程数据、DEM、建筑轮廓、白模、OSM 路网水系，或要为数字孪生/Cesium 场景准备基础数据时使用。
 ---
 
 # 数字孪生基础数据下载
@@ -12,7 +12,8 @@ description: 按坐标点一键下载数字孪生场景基础数据——高清�
 | 高清影像 | ESRI World Imagery (Maxar) / Google | z18≈0.6m/px（MODELED 估算） | GeoTIFF (EPSG:3857) |
 | 高程 DEM | Copernicus GLO-30 | 30m（标称） | GeoTIFF (EPSG:4326) |
 | 建筑物 | OpenStreetMap (Overpass) | 覆盖度不一（中国县城可能稀疏） | GeoJSON (EPSG:4326) + 属性高度 |
-| 3D 白模 | 上述建筑挤出 | 高度 POLICY 估算 | 3D Tiles 1.0 (b3dm + tileset.json) |
+| 道路/铁路/水系/绿地 | OpenStreetMap (Overpass, 同一次查询) | 覆盖随 OSM | 各自独立 GeoJSON |
+| 3D 白模 | 上述建筑挤出（含封闭屋顶） | 高度 POLICY 估算 | 3D Tiles 1.0 (b3dm + tileset.json) |
 | 预览页 | CesiumJS | 验收用 | cesium_preview.html + serve.sh |
 
 另产出 `download_report.json`：记录数据源、瓦片数、失败数、高度估算占比等证据。
@@ -53,6 +54,9 @@ http_proxy=http://127.0.0.1:58309 https_proxy=http://127.0.0.1:58309 all_proxy= 
 
 # 只要建筑数据（影像/DEM 已有）
 ... --skip-imagery --skip-dem
+
+# 不要道路/水系/绿地配套图层
+... --skip-extras
 ```
 
 参数：`--zoom 16-19`、`--radius` 米、`--geojson 边界文件`、`--buffer` 外扩米、
@@ -83,7 +87,8 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 <输出目录>/serve.sh          # 然后浏览器开 http://localhost:8000/cesium_preview.html
 ```
 
-预览页验证点：影像底图加载、白模/3D Tiles 两个图层都能显示、右下角无红色报错。
+预览页验证点：影像底图加载、建筑双图层 + 道路/铁路/水系/绿地图层都能显示（各自有开关）、
+右下角无红色报错；近景确认建筑**屋顶封闭**（白模顶面完整，不是空心管）。
 用 ego-browser 截图留证。
 
 ## 输出结构
@@ -93,12 +98,16 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 ├── imagery_z18_esri.tif      # 高清影像 (EPSG:3857)
 ├── dem_glo30_30m.tif         # 高程 (EPSG:4326)
 ├── buildings.geojson         # 建筑轮廓+height_m/base_m/top_m 属性
+├── roads.geojson             # OSM 道路（LineString，class/name/bridge/tunnel）
+├── railways.geojson          # OSM 铁路/轨交（rail/subway/tram 等）
+├── water.geojson             # 水系（河流运河 LineString + 湖泊库区 Polygon）
+├── green.geojson             # 绿地（公园/草坪/林地/球场 Polygon）
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF transform, Cesium 直接加载
 │   └── scene.b3dm
-├── cesium_preview.html       # 双图层对比预览
+├── cesium_preview.html       # 多图层预览（建筑/路网/水系/绿地独立开关）
 ├── serve.sh                  # python3 -m http.server 封装
-└── download_report.json      # 证据记录
+└── download_report.json      # 证据记录（含各图层要素数）
 ```
 
 ## 数字孪生接入
@@ -135,6 +144,12 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 > 发布副本（其他机器直接 clone 用）：https://github.com/NewRudy/twin_data_download
 > 改动本 skill 后同步 `SKILL.md requirements.txt setup_env.sh scripts/download_scene.py` 到该仓库。
 
+- **2026-11-04 Rudy Mac**（上海小涞港示范区, shp zip 输入, 6km 框）：
+  多图层链路通过——roads 3230 / railways 333 / water 168 / green 123 独立 GeoJSON✓、
+  预览页 4 个动态图层开关+分级样式✓、建筑 1014 栋屋顶封闭✓
+  （GLB 解剖: 屋顶法线 y>0.5 顶点 10963 个, 修复前为 0）、
+  图层开关/贴地-绝对高程切换交互✓、页面零 JS 错误✓
+  （截图于 小涞港示范区_scene/acceptance/）。OSM 覆盖仍不均：非中心区大片住宅无建筑。
 - **2026-11-03 Rudy Mac**（macOS, `~/.venv_imagery`, Cesium 1.142）：
   永新山区点（0 建筑→软跳过✓）+ 永新县城点全链路通过——影像 GeoTIFF✓、
   GLO-30 DEM✓（114-135m）、GeoJSON✓、3D Tiles 双图层渲染✓、z19 占位自动降级✓、
