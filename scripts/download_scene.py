@@ -34,6 +34,10 @@ try:
     from rasterio.transform import from_bounds
     from rasterio.merge import merge as rio_merge
     from shapely.geometry import Polygon, shape
+    import shapefile as pyshp
+    import zipfile
+    import tempfile
+    from pyproj import CRS, Transformer
 except ImportError as e:
     print(f"[-] 缺少依赖: {e}")
     print("[-] 请先运行 skill 目录下的 setup_env.sh")
@@ -116,6 +120,63 @@ def geojson_bbox(path, buffer_m=0.0):
         raise ValueError("GeoJSON 中没有找到坐标")
     xs, ys = acc[0::2], acc[1::2]
     w, e, s, n = min(xs), max(xs), min(ys), max(ys)
+    if not (-181 <= w <= 181 and -181 <= e <= 181 and -91 <= s <= 91 and -91 <= n <= 91):
+        raise ValueError(
+            f"GeoJSON 坐标不是经纬度 (bbox {w:.1f},{s:.1f}~{e:.1f},{n:.1f}), "
+            "疑似投影平面坐标。请提供带 .prj 的 shapefile 压缩包, 或提供定位参数")
+    d_lat = buffer_m / 111320.0
+    d_lon = buffer_m / (111320.0 * math.cos(math.radians((s + n) / 2)))
+    return w - d_lon, s - d_lat, e + d_lon, n + d_lat
+
+
+def load_bounds(path, buffer_m=0.0):
+    """边界文件 → WGS84 bbox (w,s,e,n)。
+    支持: .zip(shapefile, 需含 .prj) / .shp / .geojson / .json。
+    投影坐标用 .prj 的 WKT 经 pyproj 换算; 城市局部坐标系(如 Beijing1954 城市投影)
+    与 WGS84 间无严格转换参数时为近似换算, 误差通常在百米内。"""
+    ext = os.path.splitext(path)[1].lower()
+    shp_path = None
+    tmp_dir = None
+    if ext == ".zip":
+        tmp_dir = tempfile.mkdtemp(prefix="gis_bounds_")
+        with zipfile.ZipFile(path) as zf:
+            for name in zf.namelist():
+                if name.startswith("/") or ".." in name.replace("\\", "/").split("/"):
+                    raise ValueError(f"zip 内路径异常: {name}")
+            zf.extractall(tmp_dir)
+        for root, _, files in os.walk(tmp_dir):
+            for fn in files:
+                if fn.lower().endswith(".shp"):
+                    shp_path = os.path.join(root, fn)
+        if not shp_path:
+            raise ValueError("zip 中没有找到 .shp 文件")
+    elif ext == ".shp":
+        shp_path = path
+    if shp_path:
+        prj = os.path.splitext(shp_path)[0] + ".prj"
+        if not os.path.exists(prj):
+            raise ValueError(f"shapefile 缺少 .prj 坐标系文件: {prj}\n"
+                             "请在 ArcGIS/平台导出时勾选坐标系, 或告知 EPSG/投影参数")
+        crs = CRS.from_wkt(open(prj, encoding="utf-8", errors="replace").read())
+        tf = Transformer.from_crs(crs, CRS.from_epsg(4326), always_xy=True)
+        reader = pyshp.Reader(shp_path)
+        if reader.bbox:
+            xs = [reader.bbox[0], reader.bbox[2]]
+            ys = [reader.bbox[1], reader.bbox[3]]
+        else:
+            xs, ys = [], []
+            for sh in reader.shapes():
+                for x, y in sh.points:
+                    xs.append(x)
+                    ys.append(y)
+        lons, lats = tf.transform(xs, ys)
+        w, e = min(lons), max(lons)
+        s, n = min(lats), max(lats)
+        if tmp_dir:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+    else:
+        w, s, e, n = geojson_bbox(path, buffer_m=0.0)
     d_lat = buffer_m / 111320.0
     d_lon = buffer_m / (111320.0 * math.cos(math.radians((s + n) / 2)))
     return w - d_lon, s - d_lat, e + d_lon, n + d_lat
@@ -749,7 +810,7 @@ def main():
     ap.add_argument("--lon", type=float, default=None, help="中心经度 (WGS84); 与 --geojson 二选一")
     ap.add_argument("--lat", type=float, default=None, help="中心纬度 (WGS84); 与 --geojson 二选一")
     ap.add_argument("--geojson", type=str, default=None,
-                    help="边界 GeoJSON 文件 (Point/Line/Polygon/Multi*/Feature/FeatureCollection), 按其包围盒下载")
+                    help="边界文件: GeoJSON 或 shapefile 压缩包(.zip/.shp, 需带 .prj), 按包围盒下载")
     ap.add_argument("--buffer", type=float, default=0.0, help="--geojson 时向外扩展的米数 (默认 0)")
     ap.add_argument("--radius", type=float, default=1500.0, help="半径米数 (默认 1500, 即 3km x 3km); --geojson 时忽略")
     ap.add_argument("--zoom", type=int, choices=[16, 17, 18, 19], default=18,
@@ -771,7 +832,7 @@ def main():
     DEFAULT_HEIGHT = args.default_height
 
     if args.geojson:
-        w, s, e, n = geojson_bbox(args.geojson, buffer_m=args.buffer)
+        w, s, e, n = load_bounds(args.geojson, buffer_m=args.buffer)
         lon0, lat0 = (w + e) / 2, (s + n) / 2
         ext_m = max((e - w) * 111320.0 * math.cos(math.radians(lat0)), (n - s) * 110540.0)
         name = args.name or (os.path.splitext(os.path.basename(args.geojson))[0] or "scene_geojson")
