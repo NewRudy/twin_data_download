@@ -124,7 +124,9 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 ├── cesium/                   # --offline: CesiumJS 1.142 本地副本 (~22MB)
 ├── terrain/                  # --offline: GLO-30 heightmap-1.0 地形瓦片 + layer.json
 ├── cesium_preview.html       # 多图层预览（建筑/路网/水系/绿地独立开关）
-├── serve.sh                  # python3 -m http.server 封装
+├── serve.sh                  # macOS/Linux 启动 (自动开浏览器)
+├── serve.bat                 # Windows 双击启动 (py→python 回退, 未装 Python 给安装提示)
+├── 启动预览.command           # macOS 双击启动
 └── download_report.json      # 证据记录（含各图层要素数）
 ```
 
@@ -204,6 +206,11 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
   ③**不要补 EPSG:4326 地形 z0 西半球根**——缺根 Cesium 按不可用剪枝只 1 条 404,
   补了全 0 根反而让它认为全球地形可遍历。已知边界: 冷启动仍有约 150 条瞬时 404
   （视锥远端地面场景外瓦片, Cesium 重试 2 次）, 视觉无影响, 打开 DevTools 才可见。
+  **Windows 现场启动器（2026-11-05 补）**：Windows 无 python3 命令且 .sh 双击不执行,
+  包内新增 serve.bat（双击自动起服务+开浏览器; 内容纯 ASCII+CRLF——cmd 代码页 GBK,
+  UTF-8 中文 echo 乱码; py 启动器优先, Windows Store 的 python3 假别名不碰; 未装
+  Python 时给出 winget 安装提示）和 启动预览.command（mac 双击）; serve.sh 升级为
+  自动开浏览器。bat 在 mac 上无法真跑, 现场首用要留心。
   **本地地形 `--offline` 附带**：GLO-30→heightmap-1.0 瓦片（789 块 z0-16），格式逐项
   从 Cesium 1.142 源码核对（fIt 解包: 65×65 Uint16LE 高度格+childTileMask+1 字节水mask,
   ion 编码 u16=(h+1000)*5）。排查三连：①**UrlTemplateImageryProvider.minimumLevel>0

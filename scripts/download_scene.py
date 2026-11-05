@@ -1875,7 +1875,41 @@ __TERRAIN_JS__
 """
 
 SERVE_SH = """#!/usr/bin/env bash
-cd "$(dirname "$0")" && exec python3 -m http.server "${1:-8000}"
+# macOS/Linux: 双击运行 (mac) 或 bash serve.sh; Ctrl+C 停止
+cd "$(dirname "$0")" || exit 1
+PORT="${1:-8000}"
+( sleep 1 && open "http://localhost:$PORT/cesium_preview.html" ) >/dev/null 2>&1 &
+exec python3 -m http.server "$PORT"
+"""
+
+# Windows 现场电脑: 双击即可。内容保持纯 ASCII——cmd 的代码页是 GBK,
+# 带 UTF-8 中文 echo 会乱码。优先 py 启动器 (Windows Store 的 python3 假别名
+# 会跳商店, 不碰), 回退 python。
+SERVE_BAT = """@echo off
+rem Windows: double-click to serve. Ctrl+C to stop.
+cd /d "%~dp0"
+set PORT=8000
+set "PY="
+where py >nul 2>nul && set "PY=py"
+if not defined PY where python >nul 2>nul && set "PY=python"
+if not defined PY (
+  echo [!] Python not found. Install it first:
+  echo     winget install Python.Python.3.12
+  echo     ^(python.org installer: check "Add python.exe to PATH"^)
+  pause
+  exit /b 1
+)
+echo Serving http://localhost:%PORT%/cesium_preview.html  (Ctrl+C to stop)
+start "" cmd /c "timeout /t 1 >nul & start "" http://localhost:%PORT%/cesium_preview.html"
+%PY% -m http.server %PORT%
+"""
+
+SERVE_COMMAND = """#!/usr/bin/env bash
+# macOS: 双击运行 (首次需允许: 系统设置-隐私与安全)。Ctrl+C 停止。
+cd "$(dirname "$0")" || exit 1
+PORT="${1:-8000}"
+( sleep 1 && open "http://localhost:$PORT/cesium_preview.html" ) >/dev/null 2>&1 &
+exec python3 -m http.server "$PORT"
 """
 
 
@@ -1936,7 +1970,14 @@ def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0, extras=Non
     with open(serve_path, "w", encoding="utf-8") as f:
         f.write(SERVE_SH)
     os.chmod(serve_path, 0o755)
-    log(f"[✓] 预览页: {html_path}  (运行 {serve_path} 后浏览器打开 http://localhost:8000/cesium_preview.html)")
+    for fname, content in (("serve.bat", SERVE_BAT.replace("\n", "\r\n")),
+                           ("启动预览.command", SERVE_COMMAND)):
+        p = os.path.join(out_dir, fname)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+        os.chmod(p, 0o755)
+    log(f"[✓] 预览页: {html_path}  (双击 serve.bat[Win]/启动预览.command[mac] 或 serve.sh, "
+        "浏览器开 http://localhost:8000/cesium_preview.html)")
     return html_path
 
 

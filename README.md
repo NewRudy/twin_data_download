@@ -52,6 +52,9 @@ cd <输出目录> && ./serve.sh
 # 浏览器打开 http://localhost:8000/cesium_preview.html
 ```
 
+Windows 电脑：直接**双击 `serve.bat`**（自动起服务并打开浏览器；需已安装 Python，
+未安装时按窗口里的提示 `winget install Python.Python.3.12` 装一次即可）。
+
 预览页默认**纹理模式**（3D Tiles 立面带窗格纹理）；「高度分析」切换为按高度配色的
 GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数），默认**贴地模式**+42° 斜视角；
 接真实地形渲染时勾选「绝对高程模式」；`--offline` 产物额外带「本地地形」开关
@@ -75,7 +78,9 @@ GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数）
 ├── cesium/                   # --offline: CesiumJS 1.142 本地副本 (~22MB)
 ├── terrain/                  # --offline: GLO-30 heightmap-1.0 地形瓦片 + layer.json
 ├── cesium_preview.html
-├── serve.sh
+├── serve.sh                  # macOS/Linux 启动（自动开浏览器）
+├── serve.bat                 # Windows 双击启动
+├── 启动预览.command           # macOS 双击启动
 └── download_report.json      # 证据记录
 ```
 
