@@ -120,7 +120,7 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF transform, Cesium 直接加载
 │   ├── scene.b3dm            # ≤1500 栋: 单 tile；更多时改为 tiles/cell_*.b3dm 分块 (~350 栋/块)
-├── tiles/                    # --offline: 影像 XYZ 瓦片 z(native-6)-z(native) jpg
+├── tiles/                    # --offline: 影像 XYZ 瓦片 z0-z(native) 全金字塔 jpg
 ├── cesium/                   # --offline: CesiumJS 1.142 本地副本 (~22MB)
 ├── terrain/                  # --offline: GLO-30 heightmap-1.0 地形瓦片 + layer.json
 ├── cesium_preview.html       # 多图层预览（建筑/路网/水系/绿地独立开关）
@@ -186,9 +186,24 @@ fc=json.load(open(f'{d}/buildings.geojson')); print('buildings:', len(fc['featur
   保留 POLICY），高度分析预设从"清一色 6m 白板"变成真实城市高度梯度（商务区红≥24m、
   居住橙金、仓储绿）✓ 截图 acceptance/2026-11-05-cnbh-heights.png；面板/报告显示
   注入数✓。
-  **离线预览包 `--offline`**：影像 GeoTIFF→本地 XYZ jpg 瓦片（3403 张 z12-18, 66MB）
+  **离线预览包 `--offline`**：影像 GeoTIFF→本地 XYZ jpg 瓦片（**z0-native 全金字塔**,
+  小涞港 3294 张/75MB——z0 根必须生成, 否则初始帧请求祖先瓦片 404; 写瓦片时读窗
+  **必须裁剪到栅格范围再用 out_shape 降采样**, boundless 填充在 z0 会按 0.6m/px
+  请求 6.7TB 内存直接被系统 SIGKILL, 顺带消除了 109 张纯填充黑瓦片）
   + CesiumJS 1.142 本地化（npmmirror tgz→~/.cache→复制进输出目录）+ 图层/3D Tiles
   全部本地。浏览器验收：**外部请求数 0**、就绪状态✓ 截图 acceptance/2026-11-05-offline-preview.png。
+  **无网现场实测（2026-11-05 补）**：演示包打 zip→解压到全新路径→headless Chrome
+  双重断网（--host-resolver-rules MAP * ~NOTFOUND + --proxy-server 死端口）+ CDP
+  驱动（**Network.setCacheDisabled 必开**——Chrome 启发式缓存会跨 target 喂旧 HTML,
+  造成假绿/假红测量）。结果: 外部请求 0、JS 异常 0、勾地形→getHeight ✓、截图
+  acceptance/2026-11-05-offline-nonetwork-*.png。三连教训: ①**初始相机必须
+  setView 且在 viewer 创建后任何 await 之前**——flyTo 动画首帧是全球视角,
+  Cesium 对整个地球做四叉树影像请求（实测冷启动 200-450 条 404）; ②**不要给
+  ImageryLayer 加 rectangle 限定场景范围**——能消掉全球剪影请求, 但 SwiftShader/
+  无头渲染下影像被竖条纹拉进天空, 视觉严重损坏（视觉>控制台整洁, 已回退）;
+  ③**不要补 EPSG:4326 地形 z0 西半球根**——缺根 Cesium 按不可用剪枝只 1 条 404,
+  补了全 0 根反而让它认为全球地形可遍历。已知边界: 冷启动仍有约 150 条瞬时 404
+  （视锥远端地面场景外瓦片, Cesium 重试 2 次）, 视觉无影响, 打开 DevTools 才可见。
   **本地地形 `--offline` 附带**：GLO-30→heightmap-1.0 瓦片（789 块 z0-16），格式逐项
   从 Cesium 1.142 源码核对（fIt 解包: 65×65 Uint16LE 高度格+childTileMask+1 字节水mask,
   ion 编码 u16=(h+1000)*5）。排查三连：①**UrlTemplateImageryProvider.minimumLevel>0

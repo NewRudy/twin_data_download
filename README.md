@@ -71,7 +71,7 @@ GeoJSON 白模，还有道路/铁路/水系/绿地独立开关（带要素数）
 ├── buildings_3dtiles/
 │   ├── tileset.json          # ENU→ECEF，Cesium 直接加载
 │   └── scene.b3dm            # ≤1500 栋单 tile；更多时为 tiles/cell_*.b3dm 分块
-├── tiles/                    # --offline: 影像 XYZ 瓦片 z(native-6)-z(native)
+├── tiles/                    # --offline: 影像 XYZ 瓦片 z0-z(native) 全金字塔
 ├── cesium/                   # --offline: CesiumJS 1.142 本地副本 (~22MB)
 ├── terrain/                  # --offline: GLO-30 heightmap-1.0 地形瓦片 + layer.json
 ├── cesium_preview.html

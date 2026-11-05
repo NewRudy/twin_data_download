@@ -1251,8 +1251,9 @@ def write_imagery_tiles(tif_path, out_dir, max_zoom=None, workers=6):
     z_max = max(3, min(19, max_zoom or z_auto))
     # 注意: UrlTemplateImageryProvider.minimumLevel > 0 在 Cesium 1.142 会触发
     # "Too many properties to enumerate" 渲染崩溃, 因此 provider 一律 minimumLevel 0,
-    # 低缩放瓦片直接多生成几级 (越远级数越少, 仅十几张) 保证远处也有影像。
-    z_min = max(0, z_max - 6)
+    # 金字塔直接下探到 z0 (场景范围的祖先瓦片每级仅 1-2 张, 共约 30 张)——
+    # 否则初始帧/缩小视图请求 z<zmin 祖先瓦片 404, 控制台一片红噪。
+    z_min = 0
     lon0, lon1 = math.degrees(b.left / _MERC_R), math.degrees(b.right / _MERC_R)
     n_total = 0
     os.makedirs(out_dir, exist_ok=True)
@@ -1273,10 +1274,19 @@ def write_imagery_tiles(tif_path, out_dir, max_zoom=None, workers=6):
         s = _get_src()
         win = _win_bounds(left, bottom, right, top, s.transform)
         win = win.round_offsets().round_lengths()
-        if win.width < 1 or win.height < 1:
+        # 关键: 窗口裁剪到栅格范围。低缩放瓦片 (z0-z11) 的地理范围远大于场景 tif,
+        # boundless 填充窗口按 0.6m/px 算有天文数字像素 (z0 整球 ~67M×33M×3 ≈ 6TB,
+        # 直接被系统 SIGKILL)。裁剪后用 out_shape 在读取器内降采样到 256², 内存恒定。
+        x_off = max(0, int(win.col_off))
+        y_off = max(0, int(win.row_off))
+        x_end = min(s.width, int(win.col_off + win.width))
+        y_end = min(s.height, int(win.row_off + win.height))
+        if x_end <= x_off or y_end <= y_off:
             return 0
-        arr = s.read(window=win, boundless=True, fill_value=0)
-        img = Image.fromarray(arr.transpose(1, 2, 0), "RGB").resize((256, 256), Image.BILINEAR)
+        from rasterio.windows import Window as _Win
+        clip = _Win(x_off, y_off, x_end - x_off, y_end - y_off)
+        arr = s.read(window=clip, out_shape=(3, 256, 256))
+        img = Image.fromarray(arr.transpose(1, 2, 0), "RGB")
         td = os.path.join(out_dir, str(z), str(x))
         os.makedirs(td, exist_ok=True)
         img.save(os.path.join(td, f"{y}.jpg"), quality=82)
@@ -1301,7 +1311,9 @@ def write_imagery_tiles(tif_path, out_dir, max_zoom=None, workers=6):
             n_total += _one(j)
     mb = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(out_dir) for f in fs) / 1048576
     log(f"[✓] 离线影像瓦片: {out_dir}  ({n_total} 张 z{z_min}-z{z_max}, {mb:.0f} MB)")
-    return {"tiles": n_total, "zmin": z_min, "zmax": z_max, "mb": round(mb, 1)}
+    return {"tiles": n_total, "zmin": z_min, "zmax": z_max, "mb": round(mb, 1),
+            "img_bounds": {"w": math.degrees(b.left / _MERC_R), "e": math.degrees(b.right / _MERC_R),
+                           "s": _merc_y2lat(b.bottom), "n": _merc_y2lat(b.top)}}
 
 
 def ensure_local_cesium(scene_dir):
@@ -1365,6 +1377,9 @@ def write_terrain_tiles(dem_tif, out_dir, max_zoom=16, min_zoom=0):
         th = 180.0 / 2 ** z
         x0 = int(math.floor((b.left + 180) / tw)); x1 = int(math.floor((b.right + 180) / tw))
         y0 = int(math.floor((b.bottom + 90) / th)); y1 = int(math.floor((b.top + 90) / th))
+        # 注意: 不要补 EPSG:4326 z0 的西半球根! 缺根时 Cesium 对 404 按"子树不可用"
+        # 剪枝, 只留 1 条噪音; 反之补了全 0 根会让 Cesium 认为全球地形可遍历,
+        # 为整个地球请求影像瓦片 (场景外全部 404, 实测 300+ 条请求风暴)。
         lons = None
         for x in range(x0, x1 + 1):
             for y in range(y0, y1 + 1):
@@ -1517,6 +1532,17 @@ const viewer = new Cesium.Viewer("cesium", {  baseLayer: new Cesium.ImageryLayer
   selectionIndicator: false
 });
 window.__viewer = viewer;   // 诊断/验收脚本用
+
+// 初始视角立刻就位 (42° 斜视)——必须在任何 await/异步加载之前!
+// 默认全球视角哪怕渲染几帧, Cesium 都会对整个地球做四叉树影像请求,
+// 本地离线包场景外全是 404 (实测 200-450 条控制台噪音)。
+{
+  const dLat0 = RADIUS/111320, dLon0 = RADIUS/(111320*Math.cos(LAT*Math.PI/180));
+  viewer.camera.setView({
+    destination: Cesium.Cartesian3.fromDegrees(LON, LAT - dLat0*1.35, RADIUS*1.9),
+    orientation: { heading: 0, pitch: Cesium.Math.toRadians(-42), roll: 0 }
+  });
+}
 
 function rampColor(h){
   if(h<6)   return Cesium.Color.fromCssColorString("#dfe7ee");
@@ -1838,13 +1864,8 @@ async function loadGreen(file) {
     applyMode(false);  // 默认贴地模式
 __TERRAIN_JS__
 
-    // 初始视角: 42° 斜视, 更有三维感 (比正俯视好看)
-    const dLat = RADIUS/111320, dLon = RADIUS/(111320*Math.cos(LAT*Math.PI/180));
-    await viewer.camera.flyTo({
-      destination: Cesium.Cartesian3.fromDegrees(LON, LAT - dLat*1.35, RADIUS*1.9),
-      orientation: { heading: 0, pitch: Cesium.Math.toRadians(-42), roll: 0 },
-      duration: 1.8
-    });
+    // 初始视角已在 viewer 创建后立即 setView (见上方注释, 防全球视角触发
+    // 全地球影像请求); 搜索飞行动画仍用 flyTo (见搜索框逻辑)。
     if (st.textContent.indexOf("加载") === 0) st.textContent = "就绪 ✓__READY_NOTE__";
   } catch(e) { st.textContent = "初始化失败: " + e; }
 })();
@@ -1867,6 +1888,9 @@ def write_preview(out_dir, name, lon, lat, radius_m, median_base=0.0, extras=Non
         img_min, img_max = 0, offline["zmax"]   # minimumLevel 必须 0 (见 write_imagery_tiles 注释)
         img_mode, img_desc = "离线", f"本地离线瓦片 (z{offline['zmin']}-z{offline['zmax']}, {offline['tiles']} 张)"
         ready_note = "（离线包: Cesium 与影像均为本地文件, 无网可用）"
+        # 注意: 不要给 ImageryLayer 加 rectangle 限定场景范围来抑制场景外瓦片 404——
+        # 实测 (SwiftShader/无头) 影像会被竖条纹状拉伸进天空区, 视觉严重损坏。
+        # 场景外的瞬时 404 是已知边界, 视觉无影响 (景外地面呈深色 globe 底色)。
     else:
         head = ('<script>window.CESIUM_BASE_URL="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/";</script>\n'
                 '<script src="https://cdn.jsdelivr.net/npm/cesium@1.142.0/Build/Cesium/Cesium.js"></script>\n'
@@ -2168,6 +2192,14 @@ def main():
             dem_tif = os.path.join(out_dir, "dem_glo30_30m.tif")
             if offline_info and os.path.isfile(dem_tif):
                 offline_info["terrain"] = write_terrain_tiles(dem_tif, out_dir)
+            # 本地 favicon: 免得浏览器自动请求在控制台留一条 404 噪音
+            try:
+                from PIL import Image as _PILImg
+                _p = os.path.join(out_dir, "favicon.ico")
+                if not os.path.exists(_p):
+                    _PILImg.new("RGB", (16, 16), (34, 86, 140)).save(_p, format="ICO")
+            except Exception:
+                pass
             report["outputs"]["offline"] = offline_info
         else:
             log("[!] --offline 需要影像 GeoTIFF, 未找到, 预览页仍用在线瓦片")
